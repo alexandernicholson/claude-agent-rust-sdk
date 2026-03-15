@@ -291,6 +291,17 @@ pub struct CreateMessageRequest {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
+}
+
+/// Configuration for output format and effort level.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputConfig {
+    /// Reasoning effort: `"low"`, `"medium"`, `"high"`, or `"max"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

@@ -226,6 +226,7 @@ impl<'a> MessageBuilder<'a> {
             tool_choice: self.tool_choice,
             metadata: self.metadata,
             cache_control: self.cache_control,
+            output_config: None,
         };
 
         self.client.create_message(&request).await
