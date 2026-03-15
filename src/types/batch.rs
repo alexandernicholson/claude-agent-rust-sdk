@@ -83,9 +83,12 @@ pub struct BatchError {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BatchResultBody {
     Succeeded { message: CreateMessageResponse },
-    Errored { error: BatchError },
-    Canceled,
-    Expired,
+    Errored {
+        #[serde(default)]
+        error: Option<BatchError>,
+    },
+    Canceled {},
+    Expired {},
 }
 
 /// One line of a batch results file (JSONL).

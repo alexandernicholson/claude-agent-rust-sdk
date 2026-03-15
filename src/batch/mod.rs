@@ -112,8 +112,17 @@ impl<'a> BatchClient<'a> {
             if line.trim().is_empty() {
                 continue;
             }
-            let result: BatchResult = serde_json::from_str(line)?;
-            results.push(result);
+            match serde_json::from_str::<BatchResult>(line) {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    // Log the raw line for debugging but don't fail the entire batch
+                    debug!(
+                        error = %e,
+                        line = &line[..line.len().min(500)],
+                        "failed to parse batch result line, skipping"
+                    );
+                }
+            }
         }
 
         Ok(results)
