@@ -731,12 +731,37 @@ pub struct CreateMessageResponse {
 }
 
 impl CreateMessageResponse {
-    /// Return the text of the first `Text` content block, if any.
+    /// Return the text of the last `Text` content block, if any.
+    ///
+    /// When the response includes server tool use (e.g. `web_fetch`), the model
+    /// may emit an intermediate text block before the tool call and the actual
+    /// answer in a text block after the tool result. Returning the *last* text
+    /// block ensures callers get the final answer.
     pub fn text(&self) -> Option<&str> {
+        self.content.iter().rev().find_map(|block| match block {
+            ResponseContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    /// Return the text of the first `Text` content block, if any.
+    pub fn first_text(&self) -> Option<&str> {
         self.content.iter().find_map(|block| match block {
             ResponseContentBlock::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
+    }
+
+    /// Return all text from every `Text` content block, concatenated with newlines.
+    pub fn all_text(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|block| match block {
+                ResponseContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Return the thinking content of the first `Thinking` block, if any.
