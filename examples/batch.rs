@@ -42,12 +42,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 system: None,
                 temperature: None,
                 top_p: None,
+                top_k: None,
                 stop_sequences: None,
                 stream: None,
                 tools: None,
                 tool_choice: None,
                 metadata: None,
                 cache_control: None,
+                output_config: None,
+                thinking: None,
+                service_tier: None,
             },
         })
         .collect();
@@ -82,10 +86,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", message.text().unwrap_or("(no text)"));
             }
             BatchResultBody::Errored { error } => {
-                println!("Error: {} - {}", error.error_type, error.message);
+                if let Some(err) = error {
+                    println!("Error: {} - {}", err.error_type, err.message);
+                } else {
+                    println!("Error: (no details)");
+                }
             }
-            BatchResultBody::Canceled => println!("(canceled)"),
-            BatchResultBody::Expired => println!("(expired)"),
+            BatchResultBody::Canceled {} => println!("(canceled)"),
+            BatchResultBody::Expired {} => println!("(expired)"),
         }
     }
 

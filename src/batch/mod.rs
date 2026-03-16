@@ -8,6 +8,7 @@ use crate::client::ClaudeClient;
 use crate::error::ClaudeError;
 use crate::types::batch::{
     BatchResponse, BatchResult, BatchStatus, CreateBatchRequest,
+    ListBatchesParams, ListBatchesResponse,
 };
 
 /// Client for creating and managing message batches.
@@ -58,6 +59,48 @@ impl<'a> BatchClient<'a> {
         let headers = self.client.build_headers();
 
         debug!(url = %url, "retrieving batch");
+
+        let response = self
+            .client
+            .http()
+            .get(&url)
+            .headers(headers)
+            .send()
+            .await?;
+
+        Self::handle_response(response).await
+    }
+
+    /// List all message batches in the workspace.
+    ///
+    /// `GET /v1/messages/batches`
+    ///
+    /// Returns batches in reverse chronological order (most recent first).
+    /// Use `params` for pagination.
+    pub async fn list(
+        &self,
+        params: &ListBatchesParams,
+    ) -> Result<ListBatchesResponse, ClaudeError> {
+        let mut url = format!("{}/v1/messages/batches", self.client.base_url());
+        let headers = self.client.build_headers();
+
+        // Build query parameters
+        let mut query_parts: Vec<String> = Vec::new();
+        if let Some(ref after_id) = params.after_id {
+            query_parts.push(format!("after_id={}", after_id));
+        }
+        if let Some(ref before_id) = params.before_id {
+            query_parts.push(format!("before_id={}", before_id));
+        }
+        if let Some(limit) = params.limit {
+            query_parts.push(format!("limit={}", limit));
+        }
+        if !query_parts.is_empty() {
+            url.push('?');
+            url.push_str(&query_parts.join("&"));
+        }
+
+        debug!(url = %url, "listing batches");
 
         let response = self
             .client
@@ -152,11 +195,8 @@ impl<'a> BatchClient<'a> {
                 "polled batch"
             );
 
-            match batch.processing_status {
-                BatchStatus::Ended
-                | BatchStatus::Canceled
-                | BatchStatus::Expired => return Ok(batch),
-                _ => {}
+            if batch.processing_status == BatchStatus::Ended {
+                return Ok(batch);
             }
 
             tokio::time::sleep(poll_interval).await;

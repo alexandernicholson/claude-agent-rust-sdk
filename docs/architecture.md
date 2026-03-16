@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the internal design of `claude-agent-rust-sdk`, covering the client layer, type system, authentication, batch processing, prompt caching, and error handling.
+This document describes the internal design of `claude-agent-rust-sdk`, covering the client layer, type system, authentication, streaming, extended thinking, tool use, batch processing, prompt caching, and error handling.
 
 ---
 
@@ -18,12 +18,19 @@ This document describes the internal design of `claude-agent-rust-sdk`, covering
                         |  (src/client/)  |
                         +--------+--------+
                                  |
-                         reqwest::Client
-                                 |
-                        +--------v--------+
-                        | Claude API      |
-                        | api.anthropic   |
-                        +-----------------+
+                  +--------------+---------------+
+                  |              |               |
+            create_message  create_message_  count_tokens
+            (non-stream)    stream (SSE)     (/count_tokens)
+                  |              |               |
+                  v              v               v
+              reqwest       reqwest          reqwest
+              POST          POST+stream      POST
+                  |              |               |
+                  v              v               v
+             CreateMessage   SseStream      CountTokens
+             Response        (Stream<       Response
+                              StreamEvent>)
 ```
 
 All HTTP communication flows through a single `ClaudeClient` instance. User code interacts with the client either directly or through higher-level abstractions (`MessageBuilder`, `BatchClient`).
@@ -39,43 +46,34 @@ All HTTP communication flows through a single `ClaudeClient` instance. User code
 - A `reqwest::Client` configured with connection pooling and default timeouts.
 - The base URL (`https://api.anthropic.com`).
 - An authentication credential (API key or OAuth token).
+- A list of beta feature flags.
 
 ```
 ClaudeClient
   reqwest_client: reqwest::Client
   base_url: String
   auth: AuthMethod
+  beta_features: Vec<String>
 ```
 
-`AuthMethod` is an internal enum:
+Every outgoing request passes through `build_headers()` which:
 
-```rust
-enum AuthMethod {
-    ApiKey(String),       // sent as x-api-key header
-    OAuthToken(String),   // sent as Authorization: Bearer header
-}
-```
+1. Sets `Content-Type: application/json`.
+2. Sets `anthropic-version: 2023-06-01`.
+3. Injects the authentication header based on `AuthMethod`.
+4. If beta features are configured, sets `anthropic-beta` as a comma-separated value.
 
-Every outgoing request passes through a single internal method that:
+### Core Methods
 
-1. Constructs the full URL by joining `base_url` with the endpoint path.
-2. Injects the authentication header based on `AuthMethod`.
-3. Adds the `anthropic-version: 2023-06-01` header.
-4. Sets `Content-Type: application/json`.
-5. Serializes the request body with `serde_json`.
-6. Sends the request via `reqwest` and deserializes the response.
-
-If the API returns a non-2xx status, the client reads the error body and constructs a `ClaudeError::ApiError` with the status code, error type string, and message.
-
-### Why a single client
-
-Reusing one `reqwest::Client` across all operations shares the underlying connection pool and TLS sessions. Creating separate clients per request would open new connections each time, increasing latency and resource usage. The SDK encourages creating one `ClaudeClient` at startup and passing references where needed.
+| Method | Endpoint | Returns |
+|--------|----------|---------|
+| `create_message` | `POST /v1/messages` | `CreateMessageResponse` |
+| `create_message_stream` | `POST /v1/messages` (stream: true) | `SseStream` |
+| `count_tokens` | `POST /v1/messages/count_tokens` | `CountTokensResponse` |
 
 ---
 
 ## Authentication Flow
-
-The SDK supports two authentication methods, chosen at construction time:
 
 ### API Key (`ClaudeClient::new`)
 
@@ -83,287 +81,276 @@ The SDK supports two authentication methods, chosen at construction time:
 Request header: x-api-key: sk-ant-api03-...
 ```
 
-This is the standard method for server-side applications. The key is stored in `AuthMethod::ApiKey` and injected into every request.
-
 ### OAuth Token (`ClaudeClient::with_oauth_token`)
 
 ```
 Request header: Authorization: Bearer eyJhbGciOi...
 ```
 
-This method supports tokens obtained through OAuth flows. It is useful in contexts where an OAuth token is already available (for example, from the `CLAUDE_CODE_OAUTH_TOKEN` environment variable). The token is stored in `AuthMethod::OAuthToken`.
+### Beta Features (`ClaudeClient::with_beta`)
 
-Both methods are functionally equivalent from the API's perspective. The choice depends on how credentials are provisioned in the deployment environment.
+```
+Request header: anthropic-beta: interleaved-thinking-2025-05-14,files-api-2025-04-14
+```
 
 ---
 
 ## Type System Design
 
-All request and response types live in `src/types/`. They are plain Rust structs that derive `serde::Serialize` and `serde::Deserialize`, providing a direct mapping to the Claude API JSON format.
+All request and response types live in `src/types/`. They derive `serde::Serialize` and `serde::Deserialize`.
 
-### Request types
+### Content Block Types
 
-```
-MessageRequest
-  model: String
-  max_tokens: u32
-  messages: Vec<Message>
-  system: Option<SystemPrompt>
-  temperature: Option<f64>
-  top_p: Option<f64>
-  top_k: Option<u32>
-  stop_sequences: Option<Vec<String>>
-  stream: Option<bool>
-```
-
-```
-Message
-  role: Role           // "user" or "assistant"
-  content: Content     // String or Vec<ContentBlock>
-```
+Request-side `ContentBlock` is a tagged enum:
 
 ```
 ContentBlock
-  type: String         // "text", "image", etc.
-  text: Option<String>
-  cache_control: Option<CacheControl>
-  // ... other variant-specific fields
+  Text { text, cache_control }
+  Image { source: ImageSource, cache_control }
+  Document { source: DocumentSource, cache_control, citations, context, title }
+  ToolUse { id, name, input }
+  ToolResult { tool_use_id, content, is_error, cache_control }
+  Thinking { thinking, signature }
+  RedactedThinking { data }
 ```
 
-Optional fields use `#[serde(skip_serializing_if = "Option::is_none")]` so they are omitted from the JSON when unset, keeping payloads minimal.
-
-### Response types
+Response-side `ResponseContentBlock`:
 
 ```
-MessageResponse
-  id: String
-  type: String          // always "message"
-  role: String          // always "assistant"
-  content: Vec<ContentBlock>
-  model: String
-  stop_reason: StopReason
-  usage: Usage
+ResponseContentBlock
+  Text { text, citations }
+  ToolUse { id, name, input }
+  Thinking { thinking, signature }
+  RedactedThinking { data }
 ```
 
+### Image and Document Sources
+
 ```
-Usage
-  input_tokens: u32
-  output_tokens: u32
-  cache_creation_input_tokens: u32
-  cache_read_input_tokens: u32
+ImageSource
+  Base64 { media_type, data }
+  Url { url }
+  File { file_id }
+
+DocumentSource
+  Base64 { media_type, data }
+  Text { media_type, data }
+  Url { url }
+  Content { content }
 ```
 
-The `Usage` struct always includes cache fields. When caching is not used, these are zero.
+### Tool Definitions
 
-### Design rationale
+```
+ToolDefinition (untagged)
+  Custom(Tool)          -- user-defined tools with input_schema
+  Server(ServerTool)    -- server-side tools (web search, code exec, etc.)
+```
 
-- **Concrete types over generics.** The API surface is small enough that a fixed set of structs is clearer than a generic type hierarchy. Each struct matches one JSON schema.
-- **Enums for known values.** `Role`, `StopReason`, and `BatchStatus` are Rust enums with `#[serde(rename_all = "snake_case")]`, providing exhaustive matching.
-- **Extensible with `#[serde(deny_unknown_fields)]` off.** The API may add new fields over time. By defaulting to ignoring unknown fields during deserialization, the SDK remains forward-compatible without code changes.
+### Citation Types
+
+```
+Citation (tagged by type)
+  CharLocation { cited_text, document_index, start_char_index, end_char_index }
+  PageLocation { cited_text, document_index, start_page_number, end_page_number }
+  ContentBlockLocation { cited_text, document_index, start_block_index, end_block_index }
+  WebSearchResultLocation { cited_text, url, title }
+  SearchResultLocation { cited_text, title, source, indices }
+```
+
+---
+
+## Streaming Design
+
+### How It Works
+
+When `stream: true` is set, the API returns an SSE (Server-Sent Events) stream. The SDK processes this in layers:
+
+1. **`reqwest::Response`** provides a byte stream via `.chunk()`.
+2. **`StreamState`** buffers bytes, splits on newlines, and tracks position.
+3. **`parse_sse_line`** converts individual `data: {...}` lines into `StreamEvent` values.
+4. **`SseStream`** wraps the above in a `futures::Stream` implementation.
+
+### Event Flow
+
+```
+message_start
+  content_block_start (index 0)
+    content_block_delta (text_delta / thinking_delta / input_json_delta)
+    content_block_delta ...
+    content_block_delta (signature_delta, for thinking blocks)
+  content_block_stop (index 0)
+  content_block_start (index 1)
+    ...
+  content_block_stop (index 1)
+message_delta (stop_reason, usage)
+message_stop
+```
+
+Interspersed `ping` events are also possible. `error` events may arrive at any point.
+
+### Delta Types
+
+```
+ContentDelta (tagged by type)
+  TextDelta { text }
+  InputJsonDelta { partial_json }
+  ThinkingDelta { thinking }
+  SignatureDelta { signature }
+```
+
+### Error Handling in Streams
+
+If the API returns an `error` event, it is yielded as `StreamEvent::Error`. The caller can convert it to `ClaudeError::StreamError` if desired.
+
+---
+
+## Extended Thinking
+
+### Configuration
+
+```
+ThinkingConfig (tagged by type)
+  Enabled { budget_tokens: u32 }    -- manual thinking with fixed budget
+  Disabled {}                       -- no thinking (default)
+  Adaptive { budget_tokens: Option } -- model decides (recommended for Opus 4.6)
+```
+
+### Response
+
+When thinking is enabled, responses include `Thinking` content blocks before `Text` blocks:
+
+```json
+{
+  "content": [
+    {"type": "thinking", "thinking": "Let me analyze...", "signature": "EqQB..."},
+    {"type": "text", "text": "The answer is..."}
+  ]
+}
+```
+
+The `CreateMessageResponse::thinking()` helper extracts the first thinking block.
+
+### Streaming
+
+During streaming, thinking blocks produce `ThinkingDelta` and `SignatureDelta` events.
 
 ---
 
 ## Builder Pattern
 
-`MessageBuilder` provides a fluent API for constructing `MessageRequest` values. It enforces required fields through its constructor signature:
+`MessageBuilder` provides a fluent API. All fields except `model`, `max_tokens`, and at least one message are optional.
 
-```rust
-MessageBuilder::new(model: &str, max_tokens: u32)
-```
+Key builder methods by category:
 
-The builder accumulates messages through `.user()` and `.assistant()` calls, which append to an internal `Vec<Message>`. Optional parameters like `.temperature()` and `.system()` set fields on the builder.
-
-`.build()` consumes the builder and returns a `MessageRequest`. `.send(&client)` is a convenience that calls `.build()` followed by `client.send_message()`.
-
-### Cache-aware system prompts
-
-`.system_with_cache(text, cache_control)` wraps the system prompt in a `ContentBlock` with the `cache_control` field set:
-
-```json
-{
-  "system": [
-    {
-      "type": "text",
-      "text": "...",
-      "cache_control": { "type": "ephemeral" }
-    }
-  ]
-}
-```
-
-This is the content-block form of the system parameter, which the API requires when cache control is present.
+| Category | Methods |
+|----------|---------|
+| Required | `model()`, `max_tokens()`, `user()` |
+| Messages | `user()`, `user_blocks()`, `assistant()`, `assistant_blocks()`, `message()` |
+| System | `system()`, `system_with_cache()` |
+| Sampling | `temperature()`, `top_p()`, `top_k()`, `stop_sequences()` |
+| Tools | `tool()`, `tools()`, `custom_tools()`, `tool_choice()` |
+| Thinking | `thinking()`, `thinking_adaptive()`, `thinking_config()` |
+| Output | `effort()`, `json_schema()` |
+| Other | `stream()`, `cache_control()`, `metadata()`, `service_tier()` |
+| Send | `build()`, `send()`, `send_stream()` |
 
 ---
 
 ## Batch Processing Lifecycle
 
-The `BatchClient` wraps `ClaudeClient` to interact with the `/v1/messages/batches` endpoints. A batch job follows this lifecycle:
-
 ```
   create() -----> [in_progress] -----> [ended]
                       ^                   |
                       |                   v
-                poll_until_complete()   get_results()
+                poll_until_complete()   results()
 ```
 
-### Step 1: Create
+### List Batches
 
-`BatchClient::create(requests)` POSTs to `/v1/messages/batches` with a JSON body containing a `requests` array. Each request has:
-
-- `custom_id` -- a user-defined string for correlating results.
-- `params` -- a standard `MessageRequest`.
-
-The API returns a `BatchResponse` with the batch `id` and an initial `processing_status` of `in_progress`.
-
-### Step 2: Poll
-
-`BatchClient::poll_until_complete(batch_id, interval)` repeatedly GETs `/v1/messages/batches/{batch_id}` at the given interval. It checks the `processing_status` field:
-
-| Status | Meaning |
-|--------|---------|
-| `in_progress` | Still processing; keep polling. |
-| `ended` | All requests have completed, errored, or expired. |
-| `canceling` | Cancellation requested; may still transition to `ended`. |
-
-If the batch does not reach a terminal status within a timeout window, the method returns `ClaudeError::BatchTimeout`.
-
-### Step 3: Retrieve results
-
-`BatchClient::get_results(batch_id)` GETs `/v1/messages/batches/{batch_id}/results`, which returns a JSONL stream. Each line is parsed into a `BatchResult`:
+`GET /v1/messages/batches` with pagination:
 
 ```
-BatchResult
-  custom_id: String
-  result: BatchResultType
+ListBatchesParams
+  after_id: Option<String>
+  before_id: Option<String>
+  limit: Option<u32>
 ```
 
+Returns:
+
 ```
-BatchResultType
-  Succeeded { message: MessageResponse }
-  Errored { error: ApiErrorDetail }
-  Expired
+ListBatchesResponse
+  data: Vec<BatchResponse>
+  has_more: bool
+  first_id: Option<String>
+  last_id: Option<String>
 ```
-
-Results are available for 29 days after batch creation.
-
-### Pricing
-
-All batch usage is billed at 50% of standard API prices. This applies to both input and output tokens.
-
-### Batch limits
-
-- Maximum 100,000 requests or 256 MB per batch (whichever is reached first).
-- Batches expire after 24 hours if processing has not completed.
-- Batches are scoped to the Workspace of the API key.
 
 ---
 
 ## Prompt Caching Strategy
 
-### Cache control placement
-
-The `cache_control` field can be placed on content blocks within the `system`, `messages`, or `tools` arrays. The API caches the entire prompt prefix up to and including the marked block.
-
-In this SDK, caching is exposed through:
-
-1. `MessageBuilder::system_with_cache(text, cache_control)` -- caches the system prompt.
-2. Direct construction of `ContentBlock` values with `cache_control` set -- for caching user messages or tool definitions.
-
 ### CacheControl type
 
 ```rust
 pub struct CacheControl {
-    pub r#type: String,   // always "ephemeral"
-    pub ttl: Option<String>,  // None = 5 min, Some("1h") = 1 hour
+    pub cache_type: String,    // always "ephemeral"
+    pub ttl: Option<String>,   // None = "5m", Some("1h") = 1 hour
 }
 ```
 
-Convenience constructors:
-
-- `CacheControl::ephemeral()` -- 5-minute TTL (default).
-- `CacheControl::ephemeral_1h()` -- 1-hour TTL.
-
-### How the cache hierarchy works
-
-The Claude API evaluates cache hits by comparing the request prefix against stored cache entries. The prefix is defined by this hierarchy:
-
-```
-tools -> system -> messages
-```
-
-A change at any level invalidates that level and everything below it. For example, modifying the system prompt invalidates the system and message caches, but not the tools cache.
-
-### Cost model
-
-| Token type | Cost relative to base input |
-|------------|---------------------------|
-| Uncached input | 1.0x |
-| Cache write (5 min) | 1.25x |
-| Cache write (1 hour) | 2.0x |
-| Cache read | 0.1x |
-
-The break-even point for 5-minute caching is 2 requests (write cost is 1.25x, but the second request costs only 0.1x, for a total of 1.35x across two calls versus 2.0x without caching). For most real-world patterns, caching pays for itself almost immediately.
-
-### Minimum token requirements
-
-The cached prefix must meet a minimum token count, which varies by model:
-
-| Model | Minimum tokens |
-|-------|---------------|
-| Claude Opus 4.6, 4.5 | 4,096 |
-| Claude Sonnet 4.6 | 2,048 |
-| Claude Sonnet 4.5, 4 | 1,024 |
-| Claude Haiku 4.5 | 4,096 |
-
-If the prefix is shorter than the minimum, the `cache_control` marker is silently ignored and the tokens are billed at the standard input rate.
+Convenience constructors: `ephemeral()`, `ephemeral_5m()`, `ephemeral_1h()`.
 
 ---
 
-## Error Handling Philosophy
+## Error Handling
 
-The SDK uses a single error enum, `ClaudeError`, for all fallible operations. The design principles are:
-
-### 1. No panics in library code
-
-Every error condition returns a `Result`. The SDK never calls `unwrap()`, `expect()`, or `panic!()` on user-facing paths.
-
-### 2. Errors carry enough context to act on
-
-- `ApiError` includes the HTTP status code, the Anthropic error type string, and the human-readable message. Callers can match on `status` to implement retry logic (for example, retrying on 429 with backoff).
-- `BatchTimeout` includes the batch ID so callers can decide whether to continue polling manually.
-- `NetworkError` wraps the underlying `reqwest::Error`, preserving the full error chain.
-
-### 3. Error conversion via From
-
-`ClaudeError` implements `From<reqwest::Error>` and `From<serde_json::Error>`, so `?` propagation works naturally inside the SDK and in user code.
-
-### 4. Non-exhaustive for forward compatibility
-
-The `#[non_exhaustive]` attribute on `ClaudeError` means new variants can be added in minor versions without breaking downstream `match` statements (callers must include a wildcard arm).
-
-### Example: retry on rate limit
-
-```rust
-use std::time::Duration;
-use tokio::time::sleep;
-
-async fn send_with_retry(
-    client: &ClaudeClient,
-    request: MessageRequest,
-    max_retries: u32,
-) -> Result<MessageResponse, ClaudeError> {
-    let mut attempts = 0;
-    loop {
-        match client.send_message(&request).await {
-            Ok(response) => return Ok(response),
-            Err(ClaudeError::ApiError { status: 429, .. }) if attempts < max_retries => {
-                attempts += 1;
-                sleep(Duration::from_secs(2u64.pow(attempts))).await;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
+```
+ClaudeError
+  ApiError { status, error_type, message }
+  NetworkError(reqwest::Error)
+  SerializationError(serde_json::Error)
+  BatchTimeout { batch_id }
+  InvalidConfig(String)
+  StreamError { error_type, message }
 ```
 
-This pattern is not built into the SDK intentionally. Retry policies (exponential backoff, jitter, max attempts) vary by application, so the SDK provides the error information and lets callers implement their own strategy.
+### HTTP Error Codes
+
+| Status | Error Type |
+|--------|-----------|
+| 400 | `invalid_request_error` |
+| 401 | `authentication_error` |
+| 403 | `permission_error` |
+| 404 | `not_found_error` |
+| 413 | `request_too_large` |
+| 429 | `rate_limit_error` |
+| 500 | `api_error` |
+| 529 | `overloaded_error` |
+
+---
+
+## Token Counting
+
+The `count_tokens` endpoint allows pre-flight token counting:
+
+```
+POST /v1/messages/count_tokens
+
+CountTokensRequest { model, messages, system, tools, thinking, tool_choice }
+CountTokensResponse { input_tokens }
+```
+
+---
+
+## Model Constants
+
+The `models` module provides `&str` constants for all current model IDs:
+
+```rust
+pub const CLAUDE_OPUS_4_6: &str = "claude-opus-4-6";
+pub const CLAUDE_SONNET_4_6: &str = "claude-sonnet-4-6";
+pub const CLAUDE_HAIKU_4_5: &str = "claude-haiku-4-5";
+// ... and date-pinned variants
+```

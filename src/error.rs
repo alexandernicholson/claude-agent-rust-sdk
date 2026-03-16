@@ -26,4 +26,118 @@ pub enum ClaudeError {
     /// The SDK was configured with invalid parameters.
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
+
+    /// An error received inside a streaming event.
+    #[error("Stream error: [{error_type}] {message}")]
+    StreamError {
+        error_type: String,
+        message: String,
+    },
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    #[test]
+    fn api_error_display() {
+        let err = ClaudeError::ApiError {
+            status: 429,
+            error_type: "rate_limit_error".into(),
+            message: "Too many requests".into(),
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("429"));
+        assert!(msg.contains("rate_limit_error"));
+        assert!(msg.contains("Too many requests"));
+    }
+
+    #[test]
+    fn batch_timeout_display() {
+        let err = ClaudeError::BatchTimeout {
+            batch_id: "batch_123".into(),
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("batch_123"));
+        assert!(msg.contains("timed out"));
+    }
+
+    #[test]
+    fn invalid_config_display() {
+        let err = ClaudeError::InvalidConfig("model is required".into());
+        let msg = format!("{}", err);
+        assert!(msg.contains("model is required"));
+    }
+
+    #[test]
+    fn stream_error_display() {
+        let err = ClaudeError::StreamError {
+            error_type: "overloaded_error".into(),
+            message: "Overloaded".into(),
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("overloaded_error"));
+        assert!(msg.contains("Overloaded"));
+    }
+
+    #[test]
+    fn serialization_error_from() {
+        let serde_err = serde_json::from_str::<String>("not json").unwrap_err();
+        let err: ClaudeError = serde_err.into();
+        assert!(matches!(err, ClaudeError::SerializationError(_)));
+        // Ensure it implements std::error::Error
+        let _source = err.source();
+    }
+
+    #[test]
+    fn error_variants_are_debug() {
+        let errs: Vec<ClaudeError> = vec![
+            ClaudeError::ApiError {
+                status: 400,
+                error_type: "invalid_request_error".into(),
+                message: "bad".into(),
+            },
+            ClaudeError::BatchTimeout {
+                batch_id: "b1".into(),
+            },
+            ClaudeError::InvalidConfig("x".into()),
+            ClaudeError::StreamError {
+                error_type: "e".into(),
+                message: "m".into(),
+            },
+        ];
+        for err in errs {
+            let debug = format!("{:?}", err);
+            assert!(!debug.is_empty());
+        }
+    }
+
+    #[test]
+    fn api_error_status_codes() {
+        let codes: Vec<(u16, &str)> = vec![
+            (400, "invalid_request_error"),
+            (401, "authentication_error"),
+            (403, "permission_error"),
+            (404, "not_found_error"),
+            (413, "request_too_large"),
+            (429, "rate_limit_error"),
+            (500, "api_error"),
+            (529, "overloaded_error"),
+        ];
+        for (status, error_type) in codes {
+            let err = ClaudeError::ApiError {
+                status,
+                error_type: error_type.into(),
+                message: "test".into(),
+            };
+            let msg = format!("{}", err);
+            assert!(msg.contains(&status.to_string()));
+            assert!(msg.contains(error_type));
+        }
+    }
 }

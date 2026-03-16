@@ -1,6 +1,6 @@
 # claude-agent-rust-sdk
 
-> **Unofficial** Rust SDK for the [Claude API](https://docs.anthropic.com/en/api/messages) by Anthropic.
+> **Unofficial** Rust SDK for the [Claude API](https://platform.claude.com/docs/en/api/messages) by Anthropic.
 >
 > This is a community-maintained project and is not affiliated with or endorsed by Anthropic.
 
@@ -16,10 +16,18 @@
 A typed, ergonomic Rust client for the Claude Messages API. Built on `reqwest` and `serde`, it provides:
 
 - **Messages API** -- create single-turn and multi-turn conversations
-- **Prompt Caching** -- cache system prompts and message prefixes for up to 90% cost reduction on reads
-- **Batch Processing** -- submit thousands of requests asynchronously at 50% of standard pricing
+- **Streaming** -- async stream of SSE events with typed deltas
+- **Extended Thinking** -- enable Claude's internal reasoning with configurable token budgets
+- **Tool Use** -- define custom tools and control tool selection
+- **Vision** -- send images (base64, URL, or Files API) and documents (PDF, text)
+- **Prompt Caching** -- cache system prompts and message prefixes for up to 90% cost reduction
+- **Batch Processing** -- submit thousands of requests asynchronously at 50% pricing
+- **Token Counting** -- count tokens before sending a request
+- **Model Constants** -- typed model IDs for all current Claude models
+- **Structured Output** -- JSON schema validation for model responses
 - **Builder Pattern** -- construct requests fluently with `MessageBuilder`
 - **Strong Types** -- every API request and response is a concrete Rust type with serde mappings
+- **Citations** -- character, page, and content block citation types
 
 ---
 
@@ -39,19 +47,22 @@ The crate pulls in `reqwest`, `serde`, `tokio`, and `thiserror` transitively. Yo
 ## Quick Start
 
 ```rust
-use claude_agent_rust_sdk::{ClaudeClient, MessageBuilder};
+use claude_agent_rust_sdk::client::ClaudeClient;
+use claude_agent_rust_sdk::models;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = ClaudeClient::new("sk-ant-...");
 
-    let response = MessageBuilder::new("claude-sonnet-4-6", 1024)
+    let response = client
+        .messages()
+        .model(models::CLAUDE_SONNET_4_6)
+        .max_tokens(1024)
         .user("Explain ownership in Rust in two sentences.")
-        .build()
-        .send(&client)
+        .send()
         .await?;
 
-    println!("{}", response.content[0].text);
+    println!("{}", response.text().unwrap_or("(no text)"));
     Ok(())
 }
 ```
@@ -60,11 +71,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Authentication
 
-The SDK supports two authentication methods. Both are passed as headers on every request.
-
 ### API Key
 
-Uses the `x-api-key` header. This is the standard method for server-side applications.
+Uses the `x-api-key` header. Standard method for server-side applications.
 
 ```rust
 let client = ClaudeClient::new("sk-ant-api03-...");
@@ -72,13 +81,21 @@ let client = ClaudeClient::new("sk-ant-api03-...");
 
 ### OAuth Token
 
-Uses the `Authorization: Bearer` header. Useful when working with tokens from OAuth flows (for example, `CLAUDE_CODE_OAUTH_TOKEN`).
+Uses the `Authorization: Bearer` header. Useful for OAuth flows.
 
 ```rust
 let client = ClaudeClient::with_oauth_token("eyJhbGciOi...");
 ```
 
-Both methods target the same base URL (`https://api.anthropic.com`) and send the `anthropic-version: 2023-06-01` header automatically.
+### Beta Features
+
+Add `anthropic-beta` headers for beta features:
+
+```rust
+let client = ClaudeClient::new("sk-ant-...")
+    .with_beta("interleaved-thinking-2025-05-14")
+    .with_beta("files-api-2025-04-14");
+```
 
 ---
 
@@ -86,266 +103,287 @@ Both methods target the same base URL (`https://api.anthropic.com`) and send the
 
 ### Messages API
 
-Create a simple message:
-
 ```rust
-let response = MessageBuilder::new("claude-sonnet-4-6", 1024)
-    .user("What is the capital of France?")
-    .build()
-    .send(&client)
-    .await?;
-```
-
-Multi-turn conversation:
-
-```rust
-let response = MessageBuilder::new("claude-sonnet-4-6", 1024)
-    .user("My name is Alex.")
-    .assistant("Nice to meet you, Alex!")
-    .user("What is my name?")
-    .build()
-    .send(&client)
-    .await?;
-```
-
-Add a system prompt:
-
-```rust
-let response = MessageBuilder::new("claude-sonnet-4-6", 1024)
+let response = client
+    .messages()
+    .model(models::CLAUDE_SONNET_4_6)
+    .max_tokens(1024)
     .system("You are a concise technical writer.")
     .user("Explain TCP in one paragraph.")
-    .build()
-    .send(&client)
+    .temperature(0.7)
+    .send()
     .await?;
+
+println!("{}", response.text().unwrap_or("(no text)"));
 ```
 
-Configure optional parameters:
+### Streaming
+
+Stream responses as server-sent events:
 
 ```rust
-let response = MessageBuilder::new("claude-sonnet-4-6", 2048)
-    .system("You are a creative writing assistant.")
-    .user("Write a haiku about Rust.")
-    .temperature(0.9)
-    .top_p(0.95)
-    .stop_sequences(vec!["END".into()])
-    .build()
-    .send(&client)
+use futures::stream::StreamExt;
+use claude_agent_rust_sdk::types::{StreamEvent, ContentDelta};
+
+let mut stream = client
+    .messages()
+    .model(models::CLAUDE_SONNET_4_6)
+    .max_tokens(1024)
+    .user("Write a poem about Rust.")
+    .send_stream()
+    .await?;
+
+while let Some(event) = stream.next().await {
+    match event? {
+        StreamEvent::ContentBlockDelta {
+            delta: ContentDelta::TextDelta { text },
+            ..
+        } => print!("{}", text),
+        StreamEvent::MessageStop {} => break,
+        _ => {}
+    }
+}
+```
+
+### Extended Thinking
+
+Enable Claude's internal reasoning:
+
+```rust
+let response = client
+    .messages()
+    .model(models::CLAUDE_SONNET_4_6)
+    .max_tokens(16000)
+    .thinking(10000) // budget in tokens
+    .user("Prove that there are infinitely many primes.")
+    .send()
+    .await?;
+
+if let Some(thinking) = response.thinking() {
+    println!("Thinking: {}", thinking);
+}
+println!("Answer: {}", response.text().unwrap_or("(no text)"));
+```
+
+For Claude Opus 4.6, use adaptive thinking:
+
+```rust
+let response = client
+    .messages()
+    .model(models::CLAUDE_OPUS_4_6)
+    .max_tokens(16000)
+    .thinking_adaptive(None) // model decides
+    .user("Solve this complex problem...")
+    .send()
     .await?;
 ```
 
----
+### Tool Use
+
+Define tools the model can call:
+
+```rust
+use claude_agent_rust_sdk::types::{Tool, ToolChoice};
+
+let response = client
+    .messages()
+    .model(models::CLAUDE_SONNET_4_6)
+    .max_tokens(1024)
+    .tool(Tool {
+        name: "get_weather".into(),
+        description: "Get the current weather".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "location": {"type": "string"}
+            },
+            "required": ["location"]
+        }),
+        cache_control: None,
+    })
+    .tool_choice(ToolChoice::Auto)
+    .user("What's the weather in Tokyo?")
+    .send()
+    .await?;
+
+for (id, name, input) in response.tool_uses() {
+    println!("Tool call: {} ({}) -> {}", name, id, input);
+}
+```
+
+### Vision
+
+Send images with messages:
+
+```rust
+use claude_agent_rust_sdk::types::{ContentBlock, ImageSource};
+
+let response = client
+    .messages()
+    .model(models::CLAUDE_SONNET_4_6)
+    .max_tokens(1024)
+    .user_blocks(vec![
+        ContentBlock::Image {
+            source: ImageSource::Url {
+                url: "https://example.com/photo.jpg".into(),
+            },
+            cache_control: None,
+        },
+        ContentBlock::Text {
+            text: "Describe this image.".into(),
+            cache_control: None,
+        },
+    ])
+    .send()
+    .await?;
+```
+
+### Documents (PDF)
+
+Send PDF documents:
+
+```rust
+use claude_agent_rust_sdk::types::{ContentBlock, DocumentSource, CitationConfig};
+
+let response = client
+    .messages()
+    .model(models::CLAUDE_SONNET_4_6)
+    .max_tokens(4096)
+    .user_blocks(vec![
+        ContentBlock::Document {
+            source: DocumentSource::Base64 {
+                media_type: "application/pdf".into(),
+                data: base64_pdf_data,
+            },
+            cache_control: None,
+            citations: Some(CitationConfig { enabled: true }),
+            context: None,
+            title: Some("report.pdf".into()),
+        },
+        ContentBlock::Text {
+            text: "Summarize this document.".into(),
+            cache_control: None,
+        },
+    ])
+    .send()
+    .await?;
+```
+
+### Structured Output
+
+Require JSON output matching a schema:
+
+```rust
+let response = client
+    .messages()
+    .model(models::CLAUDE_SONNET_4_6)
+    .max_tokens(1024)
+    .json_schema(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string"},
+            "confidence": {"type": "number"}
+        },
+        "required": ["answer", "confidence"]
+    }))
+    .user("What is 2+2?")
+    .send()
+    .await?;
+```
+
+### Token Counting
+
+Count tokens before sending:
+
+```rust
+use claude_agent_rust_sdk::types::CountTokensRequest;
+
+let count = client
+    .count_tokens(&CountTokensRequest {
+        model: models::CLAUDE_SONNET_4_6.into(),
+        messages: vec![/* ... */],
+        system: None,
+        tools: None,
+        thinking: None,
+        tool_choice: None,
+    })
+    .await?;
+
+println!("Input tokens: {}", count.input_tokens);
+```
 
 ### Prompt Caching
 
-Prompt caching lets you cache prompt prefixes across API calls. Cached reads cost **10% of the base input token price** -- a 90% reduction.
-
-#### How it works
-
-Attach a `CacheControl` marker to any content block (system prompt, user message, tool definition). The API caches everything up to and including that block. Subsequent requests that share the same prefix hit the cache instead of reprocessing.
-
-#### TTL options
-
-| TTL | Cache write cost | Best for |
-|-----|-----------------|----------|
-| **5 minutes** (default) | 1.25x base input | High-frequency reuse (chatbots, agents) |
-| **1 hour** | 2.0x base input | Lower-frequency reuse (batch jobs, periodic tasks) |
-
-Cache reads always cost **0.1x base input** regardless of TTL.
-
-#### Minimum token requirements
-
-Not all prompts can be cached. The prefix must meet a minimum token count:
-
-| Model | Minimum tokens |
-|-------|---------------|
-| Claude Opus 4.6, 4.5 | 4,096 |
-| Claude Sonnet 4.6 | 2,048 |
-| Claude Sonnet 4.5, 4 | 1,024 |
-| Claude Haiku 4.5 | 4,096 |
-
-#### Example: cache a system prompt
+Cache prompt prefixes for cost savings:
 
 ```rust
 use claude_agent_rust_sdk::types::CacheControl;
 
-let response = MessageBuilder::new("claude-sonnet-4-6", 1024)
+let response = client
+    .messages()
+    .model(models::CLAUDE_SONNET_4_6)
+    .max_tokens(1024)
     .system_with_cache(
-        "You are an expert Rust developer. [... long instructions ...]",
-        CacheControl::ephemeral(),         // 5-minute TTL
+        "You are an expert Rust developer. [long instructions...]",
+        CacheControl::ephemeral(),  // 5-minute TTL
     )
     .user("How do I implement Iterator?")
-    .build()
-    .send(&client)
+    .send()
     .await?;
 
-// Check cache performance in the response:
-println!("Cache read tokens:  {}", response.usage.cache_read_input_tokens);
-println!("Cache write tokens: {}", response.usage.cache_creation_input_tokens);
+// Check cache performance:
+if let Some(cached) = response.usage.cache_read_input_tokens {
+    println!("Cache read tokens: {}", cached);
+}
 ```
-
-Use the 1-hour TTL for less frequent access patterns:
-
-```rust
-let response = MessageBuilder::new("claude-sonnet-4-6", 1024)
-    .system_with_cache(
-        "You are an expert Rust developer. [... long instructions ...]",
-        CacheControl::ephemeral_1h(),      // 1-hour TTL
-    )
-    .user("Explain lifetimes.")
-    .build()
-    .send(&client)
-    .await?;
-```
-
-You can set up to **4 cache breakpoints** per request.
-
----
 
 ### Batch Processing
 
-The Batch API lets you submit up to 100,000 message requests in a single batch. All usage is charged at **50% of standard API prices**. Most batches complete within 1 hour.
-
-#### Create a batch
+Submit batches at 50% pricing:
 
 ```rust
-use claude_agent_rust_sdk::batch::{BatchClient, BatchRequest};
+use claude_agent_rust_sdk::types::batch::{CreateBatchRequest, BatchRequest, ListBatchesParams};
 
-let batch_client = BatchClient::new(&client);
+// Create a batch
+let batch = client
+    .batches()
+    .create(&CreateBatchRequest { requests: vec![/* ... */] })
+    .await?;
 
-let requests = vec![
-    BatchRequest {
-        custom_id: "summary-1".into(),
-        params: MessageBuilder::new("claude-haiku-4-5", 1024)
-            .user("Summarize: Rust is a systems programming language...")
-            .build(),
-    },
-    BatchRequest {
-        custom_id: "summary-2".into(),
-        params: MessageBuilder::new("claude-haiku-4-5", 1024)
-            .user("Summarize: Python is a high-level language...")
-            .build(),
-    },
-];
+// List batches
+let list = client
+    .batches()
+    .list(&ListBatchesParams::default())
+    .await?;
 
-let batch = batch_client.create(requests).await?;
-println!("Batch ID: {}", batch.id);
-```
-
-#### Poll for completion
-
-```rust
-use std::time::Duration;
-
-let completed = batch_client
+// Poll until complete
+let completed = client
+    .batches()
     .poll_until_complete(&batch.id, Duration::from_secs(30))
     .await?;
 
-println!("Status: {:?}", completed.processing_status);
-```
-
-#### Retrieve results
-
-```rust
-let results = batch_client.get_results(&batch.id).await?;
-
-for result in &results {
-    match &result.result {
-        BatchResultType::Succeeded { message } => {
-            println!("[{}] {}", result.custom_id, message.content[0].text);
-        }
-        BatchResultType::Errored { error } => {
-            eprintln!("[{}] Error: {}", result.custom_id, error.message);
-        }
-        BatchResultType::Expired => {
-            eprintln!("[{}] Expired", result.custom_id);
-        }
-    }
-}
-```
-
-#### Combine caching with batching
-
-For maximum savings, use cached prompts inside batch requests. A shared system prompt is cached once and read by every request in the batch:
-
-```rust
-let shared_system = "You are a senior code reviewer. [... detailed instructions ...]";
-
-let requests: Vec<BatchRequest> = pull_requests
-    .iter()
-    .map(|pr| BatchRequest {
-        custom_id: pr.id.clone(),
-        params: MessageBuilder::new("claude-sonnet-4-6", 2048)
-            .system_with_cache(shared_system, CacheControl::ephemeral_1h())
-            .user(&format!("Review this diff:\n{}", pr.diff))
-            .build(),
-    })
-    .collect();
-
-let batch = batch_client.create(requests).await?;
-// 50% batch discount + 90% cache read discount on the system prompt
+// Get results
+let results = client.batches().results(&batch.id).await?;
 ```
 
 ---
 
-### Builder Pattern
+## Model Constants
 
-`MessageBuilder` provides a fluent interface for constructing requests:
-
-```rust
-let request = MessageBuilder::new("claude-sonnet-4-6", 1024)
-    .system("You are a helpful assistant.")
-    .user("Hello!")
-    .assistant("Hi there!")
-    .user("What can you do?")
-    .temperature(0.7)
-    .top_p(0.9)
-    .stop_sequences(vec!["DONE".into()])
-    .build();
-```
-
-The builder validates required fields at compile time through the type system. `model` and `max_tokens` are set in `new()`, and at least one user message is required before `build()` succeeds.
-
----
-
-### Error Handling
-
-All fallible operations return `Result<T, ClaudeError>`. The error type covers every failure mode:
+The `models` module provides constants for all current model IDs:
 
 ```rust
-use claude_agent_rust_sdk::ClaudeError;
+use claude_agent_rust_sdk::models;
 
-match client.send_message(request).await {
-    Ok(response) => println!("{}", response.content[0].text),
-
-    Err(ClaudeError::ApiError { status, error_type, message }) => {
-        // The API returned an error response (4xx/5xx).
-        // status: HTTP status code (e.g. 429 for rate limiting)
-        // error_type: Anthropic error type (e.g. "rate_limit_error")
-        // message: Human-readable description
-        eprintln!("API error {status} [{error_type}]: {message}");
-    }
-
-    Err(ClaudeError::NetworkError(e)) => {
-        // Connection, DNS, or timeout failure.
-        eprintln!("Network issue: {e}");
-    }
-
-    Err(ClaudeError::SerializationError(e)) => {
-        // Failed to serialize the request or deserialize the response.
-        eprintln!("Serde error: {e}");
-    }
-
-    Err(ClaudeError::BatchTimeout { batch_id }) => {
-        // A batch poll exceeded the allowed duration.
-        eprintln!("Batch {batch_id} timed out");
-    }
-
-    Err(ClaudeError::InvalidConfig(msg)) => {
-        // Invalid SDK configuration (e.g. empty API key).
-        eprintln!("Config error: {msg}");
-    }
-}
+models::CLAUDE_OPUS_4_6       // "claude-opus-4-6"
+models::CLAUDE_SONNET_4_6     // "claude-sonnet-4-6"
+models::CLAUDE_HAIKU_4_5      // "claude-haiku-4-5"
+models::CLAUDE_OPUS_4_5       // "claude-opus-4-5-20251101"
+models::CLAUDE_SONNET_4_5     // "claude-sonnet-4-5-20250929"
+// ... and more
 ```
+
+You can also pass any model ID string directly.
 
 ---
 
@@ -356,9 +394,11 @@ match client.send_message(request).await {
 | `claude-opus-4-6` | Most intelligent model -- best for agents and complex coding |
 | `claude-sonnet-4-6` | Best balance of speed and intelligence |
 | `claude-haiku-4-5` | Fastest model with near-frontier intelligence |
-| `claude-haiku-4-5-20251001` | Date-pinned Haiku 4.5 snapshot |
-
-Pass any model ID string to `MessageBuilder::new()`. The SDK does not restrict which models you use, so newer model IDs will work without an SDK update.
+| `claude-opus-4-5-20251101` | Opus 4.5, date-pinned |
+| `claude-opus-4-1-20250805` | Opus 4.1, date-pinned |
+| `claude-opus-4-20250514` | Opus 4.0, date-pinned |
+| `claude-sonnet-4-5-20250929` | Sonnet 4.5, date-pinned |
+| `claude-sonnet-4-20250514` | Sonnet 4.0, date-pinned |
 
 ---
 
@@ -367,50 +407,49 @@ Pass any model ID string to `MessageBuilder::new()`. The SDK does not restrict w
 | Feature | Status |
 |---------|--------|
 | Messages (create) | Implemented |
-| Messages (streaming) | Planned |
-| Prompt caching | Implemented |
-| Message Batches (create, poll, results) | Implemented |
-| Message Batches (cancel, list) | Planned |
-| Tool use / function calling | Planned |
-| Vision (image inputs) | Planned |
-| Extended thinking | Planned |
+| Messages (streaming) | Implemented |
+| Extended thinking (enabled, disabled, adaptive) | Implemented |
+| Tool use / function calling | Implemented |
+| Tool choice (auto, any, tool, none) | Implemented |
+| Vision (base64, URL, file) | Implemented |
+| Documents (PDF, text, URL) | Implemented |
+| Citations (char, page, block, web, search) | Implemented |
+| Structured output (JSON schema) | Implemented |
+| Prompt caching (5m, 1h TTL) | Implemented |
+| Token counting | Implemented |
+| Model constants | Implemented |
+| Beta feature headers | Implemented |
+| Message Batches (create, retrieve, poll, results) | Implemented |
+| Message Batches (list with pagination) | Implemented |
+| Message Batches (cancel) | Implemented |
+| Server tools (web search, code exec) | Types only |
 
 ---
 
-## Cost Optimization Guide
+## Error Handling
 
-Four strategies for reducing your Claude API spend, from simplest to most aggressive:
-
-### 1. Choose the right model
-
-Use `claude-haiku-4-5` for high-volume, cost-sensitive tasks. It is the cheapest model while still delivering near-frontier intelligence.
-
-### 2. Cache repeated prompts
-
-If your system prompt or few-shot examples are reused across requests, add a cache breakpoint. Reads cost **0.1x** the base input price.
+All operations return `Result<T, ClaudeError>`:
 
 ```rust
-// Without caching: 100 requests * 10,000 tokens * $3/MTok = $3.00
-// With caching:    1 write ($3.75/MTok) + 99 reads ($0.30/MTok) = $0.07
-//                  Savings: ~98%
+use claude_agent_rust_sdk::error::ClaudeError;
+
+match result {
+    Err(ClaudeError::ApiError { status, error_type, message }) => {
+        // 400 invalid_request_error, 401 authentication_error,
+        // 403 permission_error, 404 not_found_error,
+        // 413 request_too_large, 429 rate_limit_error,
+        // 500 api_error, 529 overloaded_error
+    }
+    Err(ClaudeError::StreamError { error_type, message }) => {
+        // Error received inside an SSE stream
+    }
+    Err(ClaudeError::NetworkError(e)) => { /* reqwest error */ }
+    Err(ClaudeError::SerializationError(e)) => { /* serde error */ }
+    Err(ClaudeError::BatchTimeout { batch_id }) => { /* polling timeout */ }
+    Err(ClaudeError::InvalidConfig(msg)) => { /* SDK misconfiguration */ }
+    Ok(response) => { /* success */ }
+}
 ```
-
-### 3. Batch non-urgent work
-
-Submit evaluation runs, content generation, and analysis jobs through the Batch API for a flat **50% discount** on all token costs.
-
-### 4. Combine caching and batching
-
-Use cached system prompts inside batch requests. The discounts stack:
-
-| Strategy | Input cost multiplier |
-|----------|----------------------|
-| Standard | 1.0x |
-| Cache read only | 0.1x |
-| Batch only | 0.5x |
-| Cache read + batch | 0.05x |
-
-A 10,000-token system prompt across 1,000 batch requests drops from $30 (standard) to $1.50 (cache read + batch).
 
 ---
 
@@ -443,4 +482,4 @@ This project is licensed under the [MIT License](LICENSE).
 
 This is an **unofficial**, community-maintained SDK. It is **not** affiliated with, endorsed by, or supported by Anthropic. The Claude name and API are trademarks of Anthropic, PBC.
 
-Use of this SDK is subject to Anthropic's [Terms of Service](https://www.anthropic.com/terms) and [API usage policies](https://docs.anthropic.com/en/docs/usage-policy). You are responsible for complying with all applicable terms when using the Claude API through this SDK.
+Use of this SDK is subject to Anthropic's [Terms of Service](https://www.anthropic.com/terms) and [API usage policies](https://platform.claude.com/docs/en/docs/usage-policy). You are responsible for complying with all applicable terms when using the Claude API through this SDK.
