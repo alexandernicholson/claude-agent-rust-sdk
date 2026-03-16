@@ -19,6 +19,7 @@ A typed, ergonomic Rust client for the Claude Messages API. Built on `reqwest` a
 - **Streaming** -- async stream of SSE events with typed deltas
 - **Extended Thinking** -- enable Claude's internal reasoning with configurable token budgets
 - **Tool Use** -- define custom tools and control tool selection
+- **Server Tools** -- built-in `web_fetch` and `web_search` tools that execute server-side
 - **Vision** -- send images (base64, URL, or Files API) and documents (PDF, text)
 - **Prompt Caching** -- cache system prompts and message prefixes for up to 90% cost reduction
 - **Batch Processing** -- submit thousands of requests asynchronously at 50% pricing
@@ -28,6 +29,7 @@ A typed, ergonomic Rust client for the Claude Messages API. Built on `reqwest` a
 - **Builder Pattern** -- construct requests fluently with `MessageBuilder`
 - **Strong Types** -- every API request and response is a concrete Rust type with serde mappings
 - **Citations** -- character, page, and content block citation types
+- **Transport Trait** -- pluggable backend for routing API operations through custom transports (CLI tools, mocks, proxies)
 
 ---
 
@@ -40,11 +42,20 @@ Add the dependency to your `Cargo.toml`:
 claude-agent-rust-sdk = "0.1"
 ```
 
+Or reference the Git repository directly:
+
+```toml
+[dependencies]
+claude-agent-rust-sdk = { git = "https://github.com/alexandernicholson/claude-agent-rust-sdk" }
+```
+
 The crate pulls in `reqwest`, `serde`, `tokio`, and `thiserror` transitively. Your project needs a Tokio runtime.
 
 ---
 
 ## Quick Start
+
+### Create a Message
 
 ```rust
 use claude_agent_rust_sdk::client::ClaudeClient;
@@ -62,6 +73,143 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .send()
         .await?;
 
+    println!("{}", response.text().unwrap_or("(no text)"));
+    Ok(())
+}
+```
+
+### Streaming
+
+```rust
+use futures::stream::StreamExt;
+use claude_agent_rust_sdk::client::ClaudeClient;
+use claude_agent_rust_sdk::types::{StreamEvent, ContentDelta};
+use claude_agent_rust_sdk::models;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = ClaudeClient::new("sk-ant-...");
+
+    let mut stream = client
+        .messages()
+        .model(models::CLAUDE_SONNET_4_6)
+        .max_tokens(1024)
+        .user("Write a poem about Rust.")
+        .send_stream()
+        .await?;
+
+    while let Some(event) = stream.next().await {
+        match event? {
+            StreamEvent::ContentBlockDelta {
+                delta: ContentDelta::TextDelta { text },
+                ..
+            } => print!("{}", text),
+            StreamEvent::MessageStop {} => break,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+```
+
+### Batch Processing
+
+```rust
+use std::time::Duration;
+use claude_agent_rust_sdk::client::ClaudeClient;
+use claude_agent_rust_sdk::types::batch::{CreateBatchRequest, BatchRequest};
+use claude_agent_rust_sdk::types::{CreateMessageRequest, Message, MessageContent, Role};
+use claude_agent_rust_sdk::models;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = ClaudeClient::new("sk-ant-...");
+
+    // Create a batch of requests
+    let batch = client
+        .batches()
+        .create(&CreateBatchRequest {
+            requests: vec![
+                BatchRequest {
+                    custom_id: "req-1".into(),
+                    params: CreateMessageRequest {
+                        model: models::CLAUDE_HAIKU_4_5.into(),
+                        max_tokens: 1024,
+                        messages: vec![Message {
+                            role: Role::User,
+                            content: MessageContent::Text("Hello!".into()),
+                        }],
+                        system: None, temperature: None, top_p: None, top_k: None,
+                        stop_sequences: None, stream: None, tools: None,
+                        tool_choice: None, metadata: None, cache_control: None,
+                        output_config: None, thinking: None, service_tier: None,
+                    },
+                },
+            ],
+        })
+        .await?;
+
+    // Poll until complete, then fetch results
+    let _completed = client
+        .batches()
+        .poll_until_complete(&batch.id, Duration::from_secs(30))
+        .await?;
+
+    let results = client.batches().results(&batch.id).await?;
+    println!("Got {} results", results.len());
+    Ok(())
+}
+```
+
+### Using the Transport Trait
+
+Route all API operations through a custom backend instead of HTTP:
+
+```rust
+use async_trait::async_trait;
+use claude_agent_rust_sdk::client::ClaudeClient;
+use claude_agent_rust_sdk::error::ClaudeError;
+use claude_agent_rust_sdk::transport::Transport;
+use claude_agent_rust_sdk::types::{
+    CreateMessageRequest, CreateMessageResponse, ResponseContentBlock,
+    Role, Usage,
+};
+
+#[derive(Debug)]
+struct MockTransport;
+
+#[async_trait]
+impl Transport for MockTransport {
+    async fn create_message(
+        &self,
+        _request: &CreateMessageRequest,
+    ) -> Result<CreateMessageResponse, ClaudeError> {
+        Ok(CreateMessageResponse {
+            id: "msg_mock".into(),
+            response_type: Some("message".into()),
+            model: "mock".into(),
+            role: Role::Assistant,
+            content: vec![ResponseContentBlock::Text {
+                text: "Hello from the mock!".into(),
+                citations: None,
+            }],
+            stop_reason: Some("end_turn".into()),
+            stop_sequence: None,
+            usage: Usage::default(),
+        })
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = ClaudeClient::with_transport(MockTransport);
+    let response = client
+        .messages()
+        .model("any-model")
+        .max_tokens(1024)
+        .user("Hi")
+        .send()
+        .await?;
     println!("{}", response.text().unwrap_or("(no text)"));
     Ok(())
 }
@@ -209,6 +357,38 @@ let response = client
 for (id, name, input) in response.tool_uses() {
     println!("Tool call: {} ({}) -> {}", name, id, input);
 }
+```
+
+### Server Tools
+
+Server tools (`web_fetch`, `web_search`) execute on Anthropic's servers and do not require the client to handle tool results. The model decides when to use them.
+
+```rust
+use claude_agent_rust_sdk::types::ServerTool;
+
+// Fetch and summarize a URL
+let response = client
+    .messages()
+    .model(models::CLAUDE_SONNET_4_6)
+    .max_tokens(4096)
+    .server_tool(ServerTool::web_fetch().with_max_uses(3))
+    .user("Summarize https://example.com")
+    .send()
+    .await?;
+
+// Web search with domain restrictions
+let response = client
+    .messages()
+    .model(models::CLAUDE_SONNET_4_6)
+    .max_tokens(4096)
+    .server_tool(
+        ServerTool::web_search()
+            .with_max_uses(5)
+            .with_allowed_domains(vec!["rust-lang.org".into(), "docs.rs".into()])
+    )
+    .user("What's new in Rust 1.80?")
+    .send()
+    .await?;
 ```
 
 ### Vision
@@ -368,6 +548,50 @@ let results = client.batches().results(&batch.id).await?;
 
 ---
 
+## Architecture
+
+```
+                        +-----------------+
+                        |   User Code     |
+                        +--------+--------+
+                                 |
+                    MessageBuilder / BatchClient
+                                 |
+                        +--------v--------+
+                        |  ClaudeClient   |
+                        +--------+--------+
+                                 |
+                    +------------+------------+
+                    |                         |
+             Has transport?            Has transport?
+              Yes: delegate             No: use HTTP
+                    |                         |
+             +------v------+          +-------v--------+
+             |  Transport   |          |   HttpTransport |
+             |  (custom)    |          |   (reqwest)     |
+             +-------------+          +----------------+
+```
+
+The SDK is organized around these core components:
+
+- **`ClaudeClient`** (`src/client/mod.rs`) -- the main entry point. Holds authentication, base URL, beta features, and an optional custom `Transport`. Provides `create_message`, `create_message_stream`, and `count_tokens` methods.
+
+- **`MessageBuilder`** (`src/client/builder.rs`) -- a fluent builder for constructing `CreateMessageRequest` values. Accessed via `client.messages()`. Supports all API parameters including system prompts, tools, thinking, structured output, and caching.
+
+- **`BatchClient`** (`src/batch/mod.rs`) -- client for the Message Batches API. Accessed via `client.batches()`. Supports create, retrieve, list, poll, cancel, and results.
+
+- **`Transport` trait** (`src/transport.rs`) -- abstraction over how API operations are executed. The default path sends HTTP requests via `reqwest`. Custom transports can route operations through CLI tools, mocks, or proxies. All methods have default implementations returning `Unsupported`, so you only need to implement the operations you use.
+
+- **`SseStream`** (`src/streaming.rs`) -- an async `Stream<Item = Result<StreamEvent, ClaudeError>>` that parses SSE events from a streaming response. Also supports construction from arbitrary streams via `SseStream::from_stream` for custom transports.
+
+- **Type system** (`src/types/mod.rs`, `src/types/batch.rs`) -- strongly-typed request and response types with serde mappings. Includes content blocks, tool definitions (custom + server), citations, thinking config, and streaming events.
+
+- **Error handling** (`src/error.rs`) -- a single `ClaudeError` enum covering API errors, network errors, serialization errors, batch timeouts, invalid config, stream errors, unsupported operations, and transport errors.
+
+- **Model constants** (`src/models.rs`) -- `&str` constants for all current Claude model IDs (Opus, Sonnet, Haiku families with date-pinned variants).
+
+---
+
 ## Model Constants
 
 The `models` module provides constants for all current model IDs:
@@ -389,16 +613,18 @@ You can also pass any model ID string directly.
 
 ## Supported Models
 
-| Model ID | Description |
-|----------|-------------|
-| `claude-opus-4-6` | Most intelligent model -- best for agents and complex coding |
-| `claude-sonnet-4-6` | Best balance of speed and intelligence |
-| `claude-haiku-4-5` | Fastest model with near-frontier intelligence |
-| `claude-opus-4-5-20251101` | Opus 4.5, date-pinned |
-| `claude-opus-4-1-20250805` | Opus 4.1, date-pinned |
-| `claude-opus-4-20250514` | Opus 4.0, date-pinned |
-| `claude-sonnet-4-5-20250929` | Sonnet 4.5, date-pinned |
-| `claude-sonnet-4-20250514` | Sonnet 4.0, date-pinned |
+| Constant | Model ID | Description |
+|----------|----------|-------------|
+| `CLAUDE_OPUS_4_6` | `claude-opus-4-6` | Most intelligent model -- best for agents and complex coding |
+| `CLAUDE_SONNET_4_6` | `claude-sonnet-4-6` | Best balance of speed and intelligence |
+| `CLAUDE_HAIKU_4_5` | `claude-haiku-4-5` | Fastest model with near-frontier intelligence |
+| `CLAUDE_OPUS_4_5` | `claude-opus-4-5-20251101` | Opus 4.5, date-pinned |
+| `CLAUDE_OPUS_4_1` | `claude-opus-4-1-20250805` | Opus 4.1, date-pinned |
+| `CLAUDE_OPUS_4_0` | `claude-opus-4-20250514` | Opus 4.0, date-pinned |
+| `CLAUDE_SONNET_4_5` | `claude-sonnet-4-5-20250929` | Sonnet 4.5, date-pinned |
+| `CLAUDE_SONNET_4_0` | `claude-sonnet-4-20250514` | Sonnet 4.0, date-pinned |
+| `CLAUDE_HAIKU_4_5_PINNED` | `claude-haiku-4-5-20251001` | Haiku 4.5, date-pinned |
+| `CLAUDE_3_HAIKU` | `claude-3-haiku-20240307` | Claude 3 Haiku (legacy) |
 
 ---
 
@@ -411,6 +637,7 @@ You can also pass any model ID string directly.
 | Extended thinking (enabled, disabled, adaptive) | Implemented |
 | Tool use / function calling | Implemented |
 | Tool choice (auto, any, tool, none) | Implemented |
+| Server tools (web_fetch, web_search) | Implemented |
 | Vision (base64, URL, file) | Implemented |
 | Documents (PDF, text, URL) | Implemented |
 | Citations (char, page, block, web, search) | Implemented |
@@ -419,10 +646,10 @@ You can also pass any model ID string directly.
 | Token counting | Implemented |
 | Model constants | Implemented |
 | Beta feature headers | Implemented |
+| Transport trait (pluggable backends) | Implemented |
 | Message Batches (create, retrieve, poll, results) | Implemented |
 | Message Batches (list with pagination) | Implemented |
 | Message Batches (cancel) | Implemented |
-| Server tools (web search, code exec) | Types only |
 
 ---
 
@@ -447,6 +674,8 @@ match result {
     Err(ClaudeError::SerializationError(e)) => { /* serde error */ }
     Err(ClaudeError::BatchTimeout { batch_id }) => { /* polling timeout */ }
     Err(ClaudeError::InvalidConfig(msg)) => { /* SDK misconfiguration */ }
+    Err(ClaudeError::Unsupported(op)) => { /* transport doesn't support this */ }
+    Err(ClaudeError::TransportError(msg)) => { /* transport-specific failure */ }
     Ok(response) => { /* success */ }
 }
 ```

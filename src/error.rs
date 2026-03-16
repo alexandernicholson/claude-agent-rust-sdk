@@ -1,3 +1,10 @@
+//! Error types for the Claude SDK.
+//!
+//! All fallible operations in this crate return [`ClaudeError`]. The variants
+//! cover API-level errors, network failures, serialization issues, batch
+//! timeouts, configuration mistakes, streaming errors, unsupported transport
+//! operations, and transport-specific failures.
+
 use thiserror::Error;
 
 /// Errors returned by the Claude SDK.

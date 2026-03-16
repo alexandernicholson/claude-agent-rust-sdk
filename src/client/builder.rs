@@ -1,4 +1,25 @@
 //! Ergonomic builder for [`CreateMessageRequest`].
+//!
+//! [`MessageBuilder`] provides a fluent API for constructing message requests.
+//! It supports all API parameters including system prompts, tools (custom and
+//! server), extended thinking, structured output, prompt caching, and sampling
+//! controls.
+//!
+//! Obtain a builder via [`ClaudeClient::messages`](crate::client::ClaudeClient::messages).
+//!
+//! # Example
+//!
+//! ```ignore
+//! let response = client
+//!     .messages()
+//!     .model(models::CLAUDE_SONNET_4_6)
+//!     .max_tokens(1024)
+//!     .system("You are a helpful assistant.")
+//!     .user("Hello!")
+//!     .temperature(0.7)
+//!     .send()
+//!     .await?;
+//! ```
 
 use crate::client::ClaudeClient;
 use crate::error::ClaudeError;

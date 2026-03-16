@@ -1,14 +1,16 @@
 //! Transport abstraction for the Claude SDK.
 //!
 //! The [`Transport`] trait defines how API operations are executed. The default
-//! [`HttpTransport`] sends requests to the Claude HTTP API. Custom transports
+//! The default HTTP implementation (inside `ClaudeClient`) sends requests to
+//! the Claude HTTP API. Custom transports
 //! can route operations through alternative backends (e.g. a CLI tool, a mock,
 //! or a proxy).
 //!
 //! # Implementing a custom transport
 //!
 //! Implement the [`Transport`] trait and pass it to
-//! [`ClaudeClient::with_transport`]. All methods have default implementations
+//! [`ClaudeClient::with_transport`](crate::client::ClaudeClient::with_transport).
+//! All methods have default implementations
 //! that return [`ClaudeError::Unsupported`], so you only need to implement the
 //! operations your transport supports.
 //!

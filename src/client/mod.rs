@@ -1,4 +1,22 @@
 //! HTTP client for the Claude Messages API.
+//!
+//! This module provides [`ClaudeClient`], the main entry point for the SDK.
+//! Use it to create messages, stream responses, count tokens, and access the
+//! batch API.
+//!
+//! # Authentication
+//!
+//! - [`ClaudeClient::new`] -- authenticate with a classic API key (`x-api-key` header).
+//! - [`ClaudeClient::with_oauth_token`] -- authenticate with an OAuth / Bearer token.
+//! - [`ClaudeClient::with_transport`] -- bypass HTTP entirely with a custom
+//!   [`Transport`] implementation.
+//!
+//! # Sub-clients
+//!
+//! - [`ClaudeClient::messages`] returns a [`MessageBuilder`](builder::MessageBuilder)
+//!   for fluent request construction.
+//! - [`ClaudeClient::batches`] returns a [`BatchClient`]
+//!   for the Message Batches API.
 
 pub mod builder;
 

@@ -1,4 +1,32 @@
 //! Client for the Claude Message Batches API.
+//!
+//! The [`BatchClient`] provides methods for creating, retrieving, listing,
+//! polling, canceling, and fetching results of message batches. Batches allow
+//! you to submit up to 100,000 requests at 50% of the standard API price, with
+//! results available within 24 hours.
+//!
+//! Obtain a `BatchClient` via [`ClaudeClient::batches`](crate::client::ClaudeClient::batches).
+//!
+//! # Lifecycle
+//!
+//! ```text
+//! create() --> [in_progress] --> [ended]
+//!                   ^                |
+//!                   |                v
+//!             poll_until_complete()  results()
+//! ```
+//!
+//! # Example
+//!
+//! ```ignore
+//! use std::time::Duration;
+//!
+//! let batch = client.batches().create(&request).await?;
+//! let completed = client.batches()
+//!     .poll_until_complete(&batch.id, Duration::from_secs(30))
+//!     .await?;
+//! let results = client.batches().results(&batch.id).await?;
+//! ```
 
 use std::time::Duration;
 

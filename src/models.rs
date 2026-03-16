@@ -1,7 +1,12 @@
 //! Model ID constants for the Claude API.
 //!
-//! These constants provide the current model identifiers. You can also use any
-//! model ID string directly -- the SDK does not restrict which models you use.
+//! These constants provide the current model identifiers for the Opus, Sonnet,
+//! and Haiku families. You can also use any model ID string directly -- the SDK
+//! does not restrict which models you use.
+//!
+//! Constants without a date suffix (e.g. [`CLAUDE_OPUS_4_6`]) track the latest
+//! release and may change over time. Date-pinned constants (e.g.
+//! [`CLAUDE_OPUS_4_5`]) always point to a specific snapshot.
 //!
 //! # Example
 //!

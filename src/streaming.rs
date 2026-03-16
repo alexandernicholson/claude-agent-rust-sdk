@@ -45,7 +45,7 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamEvent, ClaudeError>> {
 
 /// An async stream of [`StreamEvent`] values parsed from an SSE response.
 ///
-/// Constructed by [`ClaudeClient::create_message_stream`].
+/// Constructed by [`ClaudeClient::create_message_stream`](crate::client::ClaudeClient::create_message_stream).
 pub struct SseStream {
     /// Internal state: buffered lines from the response.
     inner: Pin<Box<dyn Stream<Item = Result<StreamEvent, ClaudeError>> + Send>>,
