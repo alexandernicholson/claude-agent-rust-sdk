@@ -2,11 +2,14 @@
 
 pub mod builder;
 
+use std::sync::Arc;
+
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use tracing::debug;
 
 use crate::error::ClaudeError;
 use crate::streaming::SseStream;
+use crate::transport::Transport;
 use crate::types::{
     ApiErrorBody, CountTokensRequest, CountTokensResponse, CreateMessageRequest,
     CreateMessageResponse,
@@ -31,6 +34,9 @@ enum AuthMethod {
 /// [`ClaudeClient::with_oauth_token`] (Bearer token), then call
 /// [`create_message`](ClaudeClient::create_message) or use the
 /// [`MessageBuilder`](builder::MessageBuilder) via [`messages`](ClaudeClient::messages).
+///
+/// For custom backends, use [`ClaudeClient::with_transport`] to provide a
+/// [`Transport`] implementation that intercepts all API operations.
 #[derive(Debug, Clone)]
 pub struct ClaudeClient {
     http: reqwest::Client,
@@ -38,32 +44,64 @@ pub struct ClaudeClient {
     auth: AuthMethod,
     /// Extra beta feature headers (e.g. `"interleaved-thinking-2025-05-14"`).
     beta_features: Vec<String>,
+    /// Optional custom transport. When set, all operations delegate to it.
+    transport: Option<Arc<dyn Transport>>,
 }
 
 impl ClaudeClient {
     // ----- constructors -----------------------------------------------------
 
     /// Create a client that authenticates with a classic API key.
+    #[must_use]
     pub fn new(api_key: &str) -> Self {
         Self {
             http: reqwest::Client::new(),
             base_url: DEFAULT_BASE_URL.to_string(),
             auth: AuthMethod::ApiKey(api_key.to_string()),
             beta_features: Vec::new(),
+            transport: None,
         }
     }
 
     /// Create a client that authenticates with an OAuth / Bearer token.
+    #[must_use]
     pub fn with_oauth_token(token: &str) -> Self {
         Self {
             http: reqwest::Client::new(),
             base_url: DEFAULT_BASE_URL.to_string(),
             auth: AuthMethod::BearerToken(token.to_string()),
             beta_features: Vec::new(),
+            transport: None,
+        }
+    }
+
+    /// Create a client backed by a custom [`Transport`].
+    ///
+    /// All API operations (messages, batches, streaming, token counting)
+    /// will be routed through the transport instead of HTTP.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use claude_agent_rust_sdk::client::ClaudeClient;
+    /// use my_transport::CliTransport;
+    ///
+    /// let client = ClaudeClient::with_transport(CliTransport::new());
+    /// let response = client.create_message(&request).await?;
+    /// ```
+    #[must_use]
+    pub fn with_transport<T: Transport + 'static>(transport: T) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            base_url: DEFAULT_BASE_URL.to_string(),
+            auth: AuthMethod::ApiKey(String::new()),
+            beta_features: Vec::new(),
+            transport: Some(Arc::new(transport)),
         }
     }
 
     /// Override the base URL (useful for testing or proxying).
+    #[must_use]
     pub fn with_base_url(mut self, url: &str) -> Self {
         self.base_url = url.trim_end_matches('/').to_string();
         self
@@ -81,6 +119,7 @@ impl ClaudeClient {
     ///     .with_beta("interleaved-thinking-2025-05-14")
     ///     .with_beta("files-api-2025-04-14");
     /// ```
+    #[must_use]
     pub fn with_beta(mut self, feature: &str) -> Self {
         self.beta_features.push(feature.to_string());
         self
@@ -90,12 +129,14 @@ impl ClaudeClient {
 
     /// Return a [`MessageBuilder`](builder::MessageBuilder) for ergonomic
     /// request construction.
+    #[must_use]
     pub fn messages(&self) -> builder::MessageBuilder<'_> {
         builder::MessageBuilder::new(self)
     }
 
     /// Return a [`BatchClient`] for interacting with the Message Batches
     /// API.
+    #[must_use]
     pub fn batches(&self) -> BatchClient<'_> {
         BatchClient::new(self)
     }
@@ -103,10 +144,20 @@ impl ClaudeClient {
     // ----- core request methods ---------------------------------------------
 
     /// Send a message-creation request and return the full response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClaudeError::ApiError`] if the API returns a non-success status,
+    /// [`ClaudeError::NetworkError`] on connection failures, or
+    /// [`ClaudeError::SerializationError`] if the response cannot be parsed.
     pub async fn create_message(
         &self,
         request: &CreateMessageRequest,
     ) -> Result<CreateMessageResponse, ClaudeError> {
+        if let Some(ref transport) = self.transport {
+            return transport.create_message(request).await;
+        }
+
         let url = format!("{}/v1/messages", self.base_url);
         let headers = self.build_headers();
 
@@ -126,7 +177,6 @@ impl ClaudeClient {
             let body = response.text().await.unwrap_or_default();
             debug!(status, body = %body, "API returned error");
 
-            // Try to parse the structured error; fall back to the raw body.
             if let Ok(api_err) = serde_json::from_str::<ApiErrorBody>(&body) {
                 return Err(ClaudeError::ApiError {
                     status,
@@ -153,6 +203,12 @@ impl ClaudeClient {
     ///
     /// The request's `stream` field is forced to `true`.
     ///
+    /// # Errors
+    ///
+    /// Returns [`ClaudeError::ApiError`] if the API returns a non-success status,
+    /// [`ClaudeError::NetworkError`] on connection failures, or
+    /// [`ClaudeError::SerializationError`] if the response cannot be parsed.
+    ///
     /// # Example
     ///
     /// ```ignore
@@ -173,6 +229,10 @@ impl ClaudeClient {
         &self,
         request: &CreateMessageRequest,
     ) -> Result<SseStream, ClaudeError> {
+        if let Some(ref transport) = self.transport {
+            return transport.create_message_stream(request).await;
+        }
+
         let url = format!("{}/v1/messages", self.base_url);
         let headers = self.build_headers();
 
@@ -216,10 +276,20 @@ impl ClaudeClient {
     /// Count the tokens in a message request without sending it.
     ///
     /// `POST /v1/messages/count_tokens`
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClaudeError::ApiError`] if the API returns a non-success status,
+    /// [`ClaudeError::NetworkError`] on connection failures, or
+    /// [`ClaudeError::SerializationError`] if the response cannot be parsed.
     pub async fn count_tokens(
         &self,
         request: &CountTokensRequest,
     ) -> Result<CountTokensResponse, ClaudeError> {
+        if let Some(ref transport) = self.transport {
+            return transport.count_tokens(request).await;
+        }
+
         let url = format!("{}/v1/messages/count_tokens", self.base_url);
         let headers = self.build_headers();
 
@@ -299,6 +369,11 @@ impl ClaudeClient {
     /// A reference to the inner `reqwest::Client` (used by sub-clients).
     pub(crate) fn http(&self) -> &reqwest::Client {
         &self.http
+    }
+
+    /// A reference to the custom transport, if any (used by sub-clients).
+    pub(crate) fn transport(&self) -> Option<&dyn Transport> {
+        self.transport.as_ref().map(AsRef::as_ref)
     }
 }
 

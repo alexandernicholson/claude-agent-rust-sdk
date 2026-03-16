@@ -35,6 +35,7 @@ pub struct CacheControl {
 
 impl CacheControl {
     /// Ephemeral cache with a 5-minute TTL.
+    #[must_use]
     pub fn ephemeral_5m() -> Self {
         Self {
             cache_type: "ephemeral".into(),
@@ -43,6 +44,7 @@ impl CacheControl {
     }
 
     /// Ephemeral cache with a 1-hour TTL.
+    #[must_use]
     pub fn ephemeral_1h() -> Self {
         Self {
             cache_type: "ephemeral".into(),
@@ -51,6 +53,7 @@ impl CacheControl {
     }
 
     /// Ephemeral cache with no explicit TTL (server default).
+    #[must_use]
     pub fn ephemeral() -> Self {
         Self {
             cache_type: "ephemeral".into(),
@@ -293,7 +296,7 @@ pub struct ServerTool {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<u32>,
 
-    /// Maximum number of content tokens to return from the tool (e.g. web_fetch).
+    /// Maximum number of content tokens to return from the tool (e.g. `web_fetch`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_content_tokens: Option<u32>,
 
@@ -324,6 +327,7 @@ impl ServerTool {
     /// The `web_fetch` tool allows Claude to fetch the content of URLs
     /// that appear in the conversation. It executes server-side and
     /// does not require the client to handle tool results.
+    #[must_use]
     pub fn web_fetch() -> Self {
         Self {
             tool_type: "web_fetch_20250910".to_string(),
@@ -339,6 +343,7 @@ impl ServerTool {
     }
 
     /// Create a `web_search` server tool with default configuration.
+    #[must_use]
     pub fn web_search() -> Self {
         Self {
             tool_type: "web_search_20250305".to_string(),
@@ -354,6 +359,7 @@ impl ServerTool {
     }
 
     /// Set the maximum number of times the tool can be used per request.
+    #[must_use]
     pub fn with_max_uses(mut self, n: u32) -> Self {
         self.max_uses = Some(n);
         self
@@ -363,30 +369,35 @@ impl ServerTool {
     ///
     /// For `web_fetch`, this limits the fetched page to approximately
     /// this many tokens, keeping costs low.
+    #[must_use]
     pub fn with_max_content_tokens(mut self, n: u32) -> Self {
         self.max_content_tokens = Some(n);
         self
     }
 
     /// Restrict the tool to only fetch from these domains.
+    #[must_use]
     pub fn with_allowed_domains(mut self, domains: Vec<String>) -> Self {
         self.allowed_domains = Some(domains);
         self
     }
 
     /// Block the tool from fetching these domains.
+    #[must_use]
     pub fn with_blocked_domains(mut self, domains: Vec<String>) -> Self {
         self.blocked_domains = Some(domains);
         self
     }
 
     /// Enable or disable citations for the tool.
+    #[must_use]
     pub fn with_citations(mut self, enabled: bool) -> Self {
         self.citations = Some(CitationsConfig { enabled });
         self
     }
 
     /// Restrict which other tools can invoke this tool.
+    #[must_use]
     pub fn with_allowed_callers(mut self, callers: Vec<String>) -> Self {
         self.allowed_callers = Some(callers);
         self
@@ -609,7 +620,7 @@ pub enum ResponseContentBlock {
         name: String,
         input: serde_json::Value,
     },
-    /// A server tool invocation (web_fetch, web_search, etc.).
+    /// A server tool invocation (`web_fetch`, `web_search`, etc.).
     ///
     /// Server tools are executed automatically by the API -- the client
     /// does not need to supply results.
@@ -618,7 +629,7 @@ pub enum ResponseContentBlock {
         name: String,
         input: serde_json::Value,
     },
-    /// The result of a server tool invocation (e.g. web_fetch content).
+    /// The result of a server tool invocation (e.g. `web_fetch` content).
     WebFetchToolResult {
         tool_use_id: String,
         content: serde_json::Value,
@@ -737,6 +748,7 @@ impl CreateMessageResponse {
     /// may emit an intermediate text block before the tool call and the actual
     /// answer in a text block after the tool result. Returning the *last* text
     /// block ensures callers get the final answer.
+    #[must_use]
     pub fn text(&self) -> Option<&str> {
         self.content.iter().rev().find_map(|block| match block {
             ResponseContentBlock::Text { text, .. } => Some(text.as_str()),
@@ -745,6 +757,7 @@ impl CreateMessageResponse {
     }
 
     /// Return the text of the first `Text` content block, if any.
+    #[must_use]
     pub fn first_text(&self) -> Option<&str> {
         self.content.iter().find_map(|block| match block {
             ResponseContentBlock::Text { text, .. } => Some(text.as_str()),
@@ -753,6 +766,7 @@ impl CreateMessageResponse {
     }
 
     /// Return all text from every `Text` content block, concatenated with newlines.
+    #[must_use]
     pub fn all_text(&self) -> String {
         self.content
             .iter()
@@ -765,6 +779,7 @@ impl CreateMessageResponse {
     }
 
     /// Return the thinking content of the first `Thinking` block, if any.
+    #[must_use]
     pub fn thinking(&self) -> Option<&str> {
         self.content.iter().find_map(|block| match block {
             ResponseContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
@@ -773,6 +788,7 @@ impl CreateMessageResponse {
     }
 
     /// Return all tool use blocks in the response.
+    #[must_use]
     pub fn tool_uses(&self) -> Vec<(&str, &str, &serde_json::Value)> {
         self.content
             .iter()
@@ -861,7 +877,7 @@ pub enum StreamEvent {
     ContentBlockStop {
         index: u32,
     },
-    /// A delta update to the top-level message (stop_reason, usage).
+    /// A delta update to the top-level message (`stop_reason`, usage).
     MessageDelta {
         delta: MessageDeltaData,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -919,7 +935,7 @@ pub enum ContentDelta {
     },
 }
 
-/// Top-level message delta (stop_reason, stop_sequence).
+/// Top-level message delta (`stop_reason`, `stop_sequence`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageDeltaData {
     #[serde(skip_serializing_if = "Option::is_none")]

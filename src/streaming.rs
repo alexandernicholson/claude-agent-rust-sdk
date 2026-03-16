@@ -51,12 +51,31 @@ pub struct SseStream {
     inner: Pin<Box<dyn Stream<Item = Result<StreamEvent, ClaudeError>> + Send>>,
 }
 
+impl std::fmt::Debug for SseStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SseStream").finish_non_exhaustive()
+    }
+}
+
 impl SseStream {
     /// Create a new `SseStream` from a `reqwest::Response`.
     ///
     /// The response must have been initiated with `stream: true`.
     pub(crate) fn from_response(response: reqwest::Response) -> Self {
         let stream = async_stream(response);
+        Self {
+            inner: Box::pin(stream),
+        }
+    }
+
+    /// Create an `SseStream` from any async stream of [`StreamEvent`] values.
+    ///
+    /// This is useful for custom [`Transport`](crate::transport::Transport)
+    /// implementations that produce stream events from non-HTTP sources.
+    pub fn from_stream<S>(stream: S) -> Self
+    where
+        S: Stream<Item = Result<StreamEvent, ClaudeError>> + Send + 'static,
+    {
         Self {
             inner: Box::pin(stream),
         }
@@ -81,7 +100,7 @@ fn async_stream(
 
                 // Read more bytes from the response
                 match state.read_chunk().await {
-                    Ok(true) => continue,   // Got more data
+                    Ok(true) => {},   // Got more data, loop again
                     Ok(false) => return None, // Stream ended
                     Err(e) => return Some((Err(e), state)),
                 }
@@ -128,7 +147,7 @@ impl StreamState {
                 let lines: Vec<String> = self
                     .buffer
                     .split('\n')
-                    .map(|s| s.to_string())
+                    .map(ToString::to_string)
                     .collect();
 
                 // The last element might be an incomplete line
@@ -147,13 +166,13 @@ impl StreamState {
             }
             None => {
                 // Process any remaining buffer
-                if !self.buffer.is_empty() {
+                if self.buffer.is_empty() {
+                    Ok(false)
+                } else {
                     let remaining = std::mem::take(&mut self.buffer);
-                    self.lines = remaining.split('\n').map(|s| s.to_string()).collect();
+                    self.lines = remaining.split('\n').map(ToString::to_string).collect();
                     self.line_index = 0;
                     Ok(true)
-                } else {
-                    Ok(false)
                 }
             }
         }

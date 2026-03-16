@@ -33,6 +33,14 @@ pub enum ClaudeError {
         error_type: String,
         message: String,
     },
+
+    /// The transport does not support this operation.
+    #[error("Unsupported operation: {0}")]
+    Unsupported(String),
+
+    /// A transport-specific error (e.g. CLI process failure).
+    #[error("Transport error: {0}")]
+    TransportError(String),
 }
 
 // ===========================================================================

@@ -22,6 +22,7 @@ use crate::types::{
 ///     .send()
 ///     .await?;
 /// ```
+#[derive(Debug)]
 pub struct MessageBuilder<'a> {
     client: &'a ClaudeClient,
     model: Option<String>,
@@ -68,12 +69,14 @@ impl<'a> MessageBuilder<'a> {
     // ----- required fields --------------------------------------------------
 
     /// Set the model identifier (e.g. `"claude-haiku-4-5"`).
+    #[must_use]
     pub fn model(mut self, model: &str) -> Self {
         self.model = Some(model.to_string());
         self
     }
 
     /// Set the maximum number of tokens to generate.
+    #[must_use]
     pub fn max_tokens(mut self, n: u32) -> Self {
         self.max_tokens = Some(n);
         self
@@ -82,6 +85,7 @@ impl<'a> MessageBuilder<'a> {
     // ----- messages ---------------------------------------------------------
 
     /// Append a user message with plain text content.
+    #[must_use]
     pub fn user(mut self, text: &str) -> Self {
         self.messages.push(Message {
             role: Role::User,
@@ -91,6 +95,7 @@ impl<'a> MessageBuilder<'a> {
     }
 
     /// Append a user message made of content blocks.
+    #[must_use]
     pub fn user_blocks(mut self, blocks: Vec<ContentBlock>) -> Self {
         self.messages.push(Message {
             role: Role::User,
@@ -100,6 +105,7 @@ impl<'a> MessageBuilder<'a> {
     }
 
     /// Append an assistant message with plain text content.
+    #[must_use]
     pub fn assistant(mut self, text: &str) -> Self {
         self.messages.push(Message {
             role: Role::Assistant,
@@ -109,6 +115,7 @@ impl<'a> MessageBuilder<'a> {
     }
 
     /// Append an assistant message made of content blocks.
+    #[must_use]
     pub fn assistant_blocks(mut self, blocks: Vec<ContentBlock>) -> Self {
         self.messages.push(Message {
             role: Role::Assistant,
@@ -118,6 +125,7 @@ impl<'a> MessageBuilder<'a> {
     }
 
     /// Append an arbitrary pre-built [`Message`].
+    #[must_use]
     pub fn message(mut self, msg: Message) -> Self {
         self.messages.push(msg);
         self
@@ -126,6 +134,7 @@ impl<'a> MessageBuilder<'a> {
     // ----- system prompt ----------------------------------------------------
 
     /// Set a plain-text system prompt.
+    #[must_use]
     pub fn system(mut self, text: &str) -> Self {
         self.system = Some(SystemPrompt::Text(text.to_string()));
         self
@@ -135,6 +144,7 @@ impl<'a> MessageBuilder<'a> {
     ///
     /// The text is wrapped in a `ContentBlock::Text` with the given
     /// [`CacheControl`] so the API can cache the prompt prefix.
+    #[must_use]
     pub fn system_with_cache(mut self, text: &str, cache: CacheControl) -> Self {
         let block = ContentBlock::Text {
             text: text.to_string(),
@@ -156,24 +166,28 @@ impl<'a> MessageBuilder<'a> {
     // ----- optional parameters ----------------------------------------------
 
     /// Set the sampling temperature (0.0 to 1.0).
+    #[must_use]
     pub fn temperature(mut self, t: f64) -> Self {
         self.temperature = Some(t);
         self
     }
 
     /// Set top-p (nucleus) sampling.
+    #[must_use]
     pub fn top_p(mut self, p: f64) -> Self {
         self.top_p = Some(p);
         self
     }
 
     /// Set top-k sampling (only sample from top K options per token).
+    #[must_use]
     pub fn top_k(mut self, k: u32) -> Self {
         self.top_k = Some(k);
         self
     }
 
     /// Set one or more stop sequences.
+    #[must_use]
     pub fn stop_sequences(mut self, seqs: Vec<String>) -> Self {
         self.stop_sequences = Some(seqs);
         self
@@ -183,19 +197,21 @@ impl<'a> MessageBuilder<'a> {
     ///
     /// Note: for streaming, prefer using [`send_stream`](Self::send_stream)
     /// which returns an async stream of events.
+    #[must_use]
     pub fn stream(mut self, enabled: bool) -> Self {
         self.stream = Some(enabled);
         self
     }
 
     /// Add a single custom tool definition.
+    #[must_use]
     pub fn tool(mut self, tool: Tool) -> Self {
         let tools = self.tools.get_or_insert_with(Vec::new);
         tools.push(ToolDefinition::Custom(tool));
         self
     }
 
-    /// Add a single server tool definition (web_fetch, web_search, etc.).
+    /// Add a single server tool definition (`web_fetch`, `web_search`, etc.).
     ///
     /// # Example
     ///
@@ -209,6 +225,7 @@ impl<'a> MessageBuilder<'a> {
     ///     .send()
     ///     .await?;
     /// ```
+    #[must_use]
     pub fn server_tool(mut self, tool: ServerTool) -> Self {
         let tools = self.tools.get_or_insert_with(Vec::new);
         tools.push(ToolDefinition::Server(tool));
@@ -216,18 +233,21 @@ impl<'a> MessageBuilder<'a> {
     }
 
     /// Provide multiple tool definitions (custom and/or server tools).
+    #[must_use]
     pub fn tools(mut self, tools: Vec<ToolDefinition>) -> Self {
         self.tools = Some(tools);
         self
     }
 
     /// Provide custom tool definitions.
+    #[must_use]
     pub fn custom_tools(mut self, tools: Vec<Tool>) -> Self {
         self.tools = Some(tools.into_iter().map(ToolDefinition::Custom).collect());
         self
     }
 
     /// Set the tool-choice strategy.
+    #[must_use]
     pub fn tool_choice(mut self, choice: ToolChoice) -> Self {
         self.tool_choice = Some(choice);
         self
@@ -236,6 +256,7 @@ impl<'a> MessageBuilder<'a> {
     /// Enable extended thinking with a specific token budget.
     ///
     /// The budget must be >= 1024 and less than `max_tokens`.
+    #[must_use]
     pub fn thinking(mut self, budget_tokens: u32) -> Self {
         self.thinking = Some(ThinkingConfig::Enabled { budget_tokens });
         self
@@ -244,30 +265,35 @@ impl<'a> MessageBuilder<'a> {
     /// Enable adaptive thinking (recommended for Claude Opus 4.6).
     ///
     /// The model decides whether and how much to think.
+    #[must_use]
     pub fn thinking_adaptive(mut self, budget_tokens: Option<u32>) -> Self {
         self.thinking = Some(ThinkingConfig::Adaptive { budget_tokens });
         self
     }
 
     /// Set the full thinking configuration.
+    #[must_use]
     pub fn thinking_config(mut self, config: ThinkingConfig) -> Self {
         self.thinking = Some(config);
         self
     }
 
     /// Attach request-level metadata.
+    #[must_use]
     pub fn metadata(mut self, meta: Metadata) -> Self {
         self.metadata = Some(meta);
         self
     }
 
     /// Attach top-level cache control.
+    #[must_use]
     pub fn cache_control(mut self, cc: CacheControl) -> Self {
         self.cache_control = Some(cc);
         self
     }
 
     /// Set the reasoning effort level (`"low"`, `"medium"`, `"high"`, `"max"`).
+    #[must_use]
     pub fn effort(mut self, effort: &str) -> Self {
         let config = self.output_config.get_or_insert(OutputConfig {
             effort: None,
@@ -278,6 +304,7 @@ impl<'a> MessageBuilder<'a> {
     }
 
     /// Set a JSON schema for structured output.
+    #[must_use]
     pub fn json_schema(mut self, schema: serde_json::Value) -> Self {
         let config = self.output_config.get_or_insert(OutputConfig {
             effort: None,
@@ -288,6 +315,7 @@ impl<'a> MessageBuilder<'a> {
     }
 
     /// Set the service tier (`"auto"` or `"standard_only"`).
+    #[must_use]
     pub fn service_tier(mut self, tier: &str) -> Self {
         self.service_tier = Some(tier.to_string());
         self
@@ -296,6 +324,8 @@ impl<'a> MessageBuilder<'a> {
     // ----- build ------------------------------------------------------------
 
     /// Build the [`CreateMessageRequest`] without sending it.
+    ///
+    /// # Errors
     ///
     /// Returns [`ClaudeError::InvalidConfig`] if `model` or `max_tokens` have
     /// not been set, or if no messages have been added.
@@ -337,8 +367,11 @@ impl<'a> MessageBuilder<'a> {
 
     /// Build the request, send it, and return the response.
     ///
+    /// # Errors
+    ///
     /// Returns [`ClaudeError::InvalidConfig`] if `model` or `max_tokens` have
-    /// not been set.
+    /// not been set, [`ClaudeError::ApiError`] if the API returns a non-success
+    /// status, or [`ClaudeError::NetworkError`] on connection failures.
     pub async fn send(self) -> Result<CreateMessageResponse, ClaudeError> {
         let client = self.client;
         let request = self.build()?;
@@ -349,6 +382,12 @@ impl<'a> MessageBuilder<'a> {
     /// of SSE events.
     ///
     /// The request's `stream` field is forced to `true`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClaudeError::InvalidConfig`] if `model` or `max_tokens` have
+    /// not been set, [`ClaudeError::ApiError`] if the API returns a non-success
+    /// status, or [`ClaudeError::NetworkError`] on connection failures.
     pub async fn send_stream(self) -> Result<SseStream, ClaudeError> {
         let client = self.client;
         let request = self.build()?;

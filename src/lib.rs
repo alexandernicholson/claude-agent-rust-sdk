@@ -1,3 +1,5 @@
+#![deny(clippy::all, clippy::pedantic, missing_debug_implementations, unused_must_use)]
+
 //! Unofficial Rust SDK for the Claude API.
 //!
 //! # Quick start
@@ -65,4 +67,5 @@ pub mod client;
 pub mod error;
 pub mod models;
 pub mod streaming;
+pub mod transport;
 pub mod types;
