@@ -260,26 +260,137 @@ pub struct Tool {
 // ServerTool
 // ---------------------------------------------------------------------------
 
-/// A server-side tool definition (web search, code execution, etc.).
+/// Configuration to enable/disable citations on a server tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CitationsConfig {
+    pub enabled: bool,
+}
+
+/// A server-side tool definition (web search, web fetch, code execution, etc.).
 ///
 /// Server tools are identified by their `type` field and have tool-specific
 /// configuration. Use [`ToolDefinition`] to mix custom and server tools.
+///
+/// # Example
+///
+/// ```
+/// use claude_agent_rust_sdk::types::ServerTool;
+///
+/// let tool = ServerTool::web_fetch()
+///     .with_max_uses(1)
+///     .with_max_content_tokens(5000);
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerTool {
-    /// The server tool type, e.g. `"web_search_20250305"`.
+    /// The server tool type, e.g. `"web_search_20250305"`, `"web_fetch_20250910"`.
     #[serde(rename = "type")]
     pub tool_type: String,
 
-    /// Tool name (e.g. `"web_search"`).
+    /// Tool name (e.g. `"web_search"`, `"web_fetch"`).
     pub name: String,
 
     /// Maximum number of times the tool can be used in a single request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<u32>,
 
+    /// Maximum number of content tokens to return from the tool (e.g. web_fetch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_content_tokens: Option<u32>,
+
+    /// List of allowed domains for web tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<Vec<String>>,
+
+    /// List of blocked domains for web tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_domains: Option<Vec<String>>,
+
+    /// Citations configuration for the tool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub citations: Option<CitationsConfig>,
+
+    /// List of allowed callers (tool names that can invoke this tool).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_callers: Option<Vec<String>>,
+
     /// Additional tool-specific configuration (flattened into the JSON).
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ServerTool {
+    /// Create a `web_fetch` server tool with default configuration.
+    ///
+    /// The `web_fetch` tool allows Claude to fetch the content of URLs
+    /// that appear in the conversation. It executes server-side and
+    /// does not require the client to handle tool results.
+    pub fn web_fetch() -> Self {
+        Self {
+            tool_type: "web_fetch_20250910".to_string(),
+            name: "web_fetch".to_string(),
+            max_uses: None,
+            max_content_tokens: None,
+            allowed_domains: None,
+            blocked_domains: None,
+            citations: None,
+            allowed_callers: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    /// Create a `web_search` server tool with default configuration.
+    pub fn web_search() -> Self {
+        Self {
+            tool_type: "web_search_20250305".to_string(),
+            name: "web_search".to_string(),
+            max_uses: None,
+            max_content_tokens: None,
+            allowed_domains: None,
+            blocked_domains: None,
+            citations: None,
+            allowed_callers: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    /// Set the maximum number of times the tool can be used per request.
+    pub fn with_max_uses(mut self, n: u32) -> Self {
+        self.max_uses = Some(n);
+        self
+    }
+
+    /// Set the maximum number of content tokens returned by the tool.
+    ///
+    /// For `web_fetch`, this limits the fetched page to approximately
+    /// this many tokens, keeping costs low.
+    pub fn with_max_content_tokens(mut self, n: u32) -> Self {
+        self.max_content_tokens = Some(n);
+        self
+    }
+
+    /// Restrict the tool to only fetch from these domains.
+    pub fn with_allowed_domains(mut self, domains: Vec<String>) -> Self {
+        self.allowed_domains = Some(domains);
+        self
+    }
+
+    /// Block the tool from fetching these domains.
+    pub fn with_blocked_domains(mut self, domains: Vec<String>) -> Self {
+        self.blocked_domains = Some(domains);
+        self
+    }
+
+    /// Enable or disable citations for the tool.
+    pub fn with_citations(mut self, enabled: bool) -> Self {
+        self.citations = Some(CitationsConfig { enabled });
+        self
+    }
+
+    /// Restrict which other tools can invoke this tool.
+    pub fn with_allowed_callers(mut self, callers: Vec<String>) -> Self {
+        self.allowed_callers = Some(callers);
+        self
+    }
 }
 
 /// A tool definition that can be either a custom tool or a server tool.
@@ -497,6 +608,20 @@ pub enum ResponseContentBlock {
         id: String,
         name: String,
         input: serde_json::Value,
+    },
+    /// A server tool invocation (web_fetch, web_search, etc.).
+    ///
+    /// Server tools are executed automatically by the API -- the client
+    /// does not need to supply results.
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    /// The result of a server tool invocation (e.g. web_fetch content).
+    WebFetchToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
     },
     /// Extended thinking content.
     Thinking {
@@ -1312,6 +1437,222 @@ mod tests {
         });
         let json = serde_json::to_value(&td).unwrap();
         assert_eq!(json["name"], "calc");
+    }
+
+    // -- ServerTool --
+
+    #[test]
+    fn server_tool_web_fetch_constructor() {
+        let tool = ServerTool::web_fetch();
+        assert_eq!(tool.tool_type, "web_fetch_20250910");
+        assert_eq!(tool.name, "web_fetch");
+        assert!(tool.max_uses.is_none());
+        assert!(tool.max_content_tokens.is_none());
+    }
+
+    #[test]
+    fn server_tool_web_search_constructor() {
+        let tool = ServerTool::web_search();
+        assert_eq!(tool.tool_type, "web_search_20250305");
+        assert_eq!(tool.name, "web_search");
+    }
+
+    #[test]
+    fn server_tool_with_max_uses() {
+        let tool = ServerTool::web_fetch().with_max_uses(3);
+        assert_eq!(tool.max_uses, Some(3));
+    }
+
+    #[test]
+    fn server_tool_with_max_content_tokens() {
+        let tool = ServerTool::web_fetch().with_max_content_tokens(5000);
+        assert_eq!(tool.max_content_tokens, Some(5000));
+    }
+
+    #[test]
+    fn server_tool_with_allowed_domains() {
+        let tool = ServerTool::web_fetch()
+            .with_allowed_domains(vec!["example.com".into()]);
+        assert_eq!(
+            tool.allowed_domains.as_ref().unwrap(),
+            &vec!["example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn server_tool_with_blocked_domains() {
+        let tool = ServerTool::web_fetch()
+            .with_blocked_domains(vec!["private.example.com".into()]);
+        assert_eq!(
+            tool.blocked_domains.as_ref().unwrap(),
+            &vec!["private.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn server_tool_with_citations() {
+        let tool = ServerTool::web_fetch().with_citations(true);
+        assert!(tool.citations.as_ref().unwrap().enabled);
+    }
+
+    #[test]
+    fn server_tool_with_allowed_callers() {
+        let tool = ServerTool::web_fetch()
+            .with_allowed_callers(vec!["summarize".into()]);
+        assert_eq!(
+            tool.allowed_callers.as_ref().unwrap(),
+            &vec!["summarize".to_string()]
+        );
+    }
+
+    #[test]
+    fn server_tool_web_fetch_serialization() {
+        let tool = ServerTool::web_fetch()
+            .with_max_uses(1)
+            .with_max_content_tokens(5000);
+        let json = serde_json::to_value(&tool).unwrap();
+        assert_eq!(json["type"], "web_fetch_20250910");
+        assert_eq!(json["name"], "web_fetch");
+        assert_eq!(json["max_uses"], 1);
+        assert_eq!(json["max_content_tokens"], 5000);
+        // Optional fields should be absent
+        assert!(json.get("allowed_domains").is_none());
+        assert!(json.get("blocked_domains").is_none());
+        assert!(json.get("citations").is_none());
+        assert!(json.get("allowed_callers").is_none());
+    }
+
+    #[test]
+    fn server_tool_web_fetch_full_serialization() {
+        let tool = ServerTool::web_fetch()
+            .with_max_uses(1)
+            .with_max_content_tokens(5000)
+            .with_allowed_domains(vec!["example.com".into()])
+            .with_blocked_domains(vec!["private.example.com".into()])
+            .with_citations(true);
+        let json = serde_json::to_value(&tool).unwrap();
+        assert_eq!(json["type"], "web_fetch_20250910");
+        assert_eq!(json["name"], "web_fetch");
+        assert_eq!(json["max_uses"], 1);
+        assert_eq!(json["max_content_tokens"], 5000);
+        assert_eq!(json["allowed_domains"][0], "example.com");
+        assert_eq!(json["blocked_domains"][0], "private.example.com");
+        assert_eq!(json["citations"]["enabled"], true);
+    }
+
+    #[test]
+    fn server_tool_round_trip() {
+        let tool = ServerTool::web_fetch()
+            .with_max_uses(2)
+            .with_max_content_tokens(3000);
+        let json = serde_json::to_value(&tool).unwrap();
+        let back: ServerTool = serde_json::from_value(json).unwrap();
+        assert_eq!(back.tool_type, "web_fetch_20250910");
+        assert_eq!(back.name, "web_fetch");
+        assert_eq!(back.max_uses, Some(2));
+        assert_eq!(back.max_content_tokens, Some(3000));
+    }
+
+    #[test]
+    fn tool_definition_server_serialization() {
+        let td = ToolDefinition::Server(
+            ServerTool::web_fetch().with_max_uses(1),
+        );
+        let json = serde_json::to_value(&td).unwrap();
+        assert_eq!(json["type"], "web_fetch_20250910");
+        assert_eq!(json["name"], "web_fetch");
+        assert_eq!(json["max_uses"], 1);
+        // Should NOT have "description" or "input_schema" (those are for Custom tools)
+        assert!(json.get("description").is_none());
+        assert!(json.get("input_schema").is_none());
+    }
+
+    #[test]
+    fn tool_definition_mixed_custom_and_server() {
+        let tools = vec![
+            ToolDefinition::Custom(Tool {
+                name: "calc".into(),
+                description: "Calculator".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                cache_control: None,
+            }),
+            ToolDefinition::Server(
+                ServerTool::web_fetch().with_max_uses(1),
+            ),
+        ];
+        let json = serde_json::to_value(&tools).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        // First: custom tool (has "description")
+        assert_eq!(arr[0]["name"], "calc");
+        assert_eq!(arr[0]["description"], "Calculator");
+        // Second: server tool (has "type" as tool type)
+        assert_eq!(arr[1]["type"], "web_fetch_20250910");
+        assert_eq!(arr[1]["name"], "web_fetch");
+    }
+
+    #[test]
+    fn server_tool_no_optional_fields_in_json() {
+        let tool = ServerTool::web_fetch();
+        let json = serde_json::to_value(&tool).unwrap();
+        // Only type and name should be present
+        assert_eq!(json["type"], "web_fetch_20250910");
+        assert_eq!(json["name"], "web_fetch");
+        assert!(json.get("max_uses").is_none());
+        assert!(json.get("max_content_tokens").is_none());
+        assert!(json.get("allowed_domains").is_none());
+        assert!(json.get("blocked_domains").is_none());
+        assert!(json.get("citations").is_none());
+        assert!(json.get("allowed_callers").is_none());
+    }
+
+    // -- CitationsConfig --
+
+    #[test]
+    fn citations_config_round_trip() {
+        let cc = CitationsConfig { enabled: true };
+        let json = serde_json::to_value(&cc).unwrap();
+        assert_eq!(json["enabled"], true);
+        let back: CitationsConfig = serde_json::from_value(json).unwrap();
+        assert!(back.enabled);
+    }
+
+    // -- ResponseContentBlock: server tool variants --
+
+    #[test]
+    fn response_content_block_server_tool_use() {
+        let json = serde_json::json!({
+            "type": "server_tool_use",
+            "id": "srvtoolu_123",
+            "name": "web_fetch",
+            "input": {"url": "https://example.com"}
+        });
+        let block: ResponseContentBlock = serde_json::from_value(json).unwrap();
+        match block {
+            ResponseContentBlock::ServerToolUse { id, name, input } => {
+                assert_eq!(id, "srvtoolu_123");
+                assert_eq!(name, "web_fetch");
+                assert_eq!(input["url"], "https://example.com");
+            }
+            _ => panic!("expected ServerToolUse"),
+        }
+    }
+
+    #[test]
+    fn response_content_block_web_fetch_tool_result() {
+        let json = serde_json::json!({
+            "type": "web_fetch_tool_result",
+            "tool_use_id": "srvtoolu_123",
+            "content": "Page content here"
+        });
+        let block: ResponseContentBlock = serde_json::from_value(json).unwrap();
+        match block {
+            ResponseContentBlock::WebFetchToolResult { tool_use_id, content } => {
+                assert_eq!(tool_use_id, "srvtoolu_123");
+                assert_eq!(content, "Page content here");
+            }
+            _ => panic!("expected WebFetchToolResult"),
+        }
     }
 
     // -- Metadata --

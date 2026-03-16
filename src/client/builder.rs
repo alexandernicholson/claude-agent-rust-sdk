@@ -5,8 +5,8 @@ use crate::error::ClaudeError;
 use crate::streaming::SseStream;
 use crate::types::{
     CacheControl, ContentBlock, CreateMessageRequest, CreateMessageResponse, Message,
-    MessageContent, Metadata, OutputConfig, OutputFormat, Role, SystemPrompt, ThinkingConfig,
-    Tool, ToolChoice, ToolDefinition,
+    MessageContent, Metadata, OutputConfig, OutputFormat, Role, ServerTool, SystemPrompt,
+    ThinkingConfig, Tool, ToolChoice, ToolDefinition,
 };
 
 /// A fluent builder for constructing and sending a message request.
@@ -192,6 +192,26 @@ impl<'a> MessageBuilder<'a> {
     pub fn tool(mut self, tool: Tool) -> Self {
         let tools = self.tools.get_or_insert_with(Vec::new);
         tools.push(ToolDefinition::Custom(tool));
+        self
+    }
+
+    /// Add a single server tool definition (web_fetch, web_search, etc.).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let req = client
+    ///     .messages()
+    ///     .model("claude-haiku-4-5")
+    ///     .max_tokens(1024)
+    ///     .user("Summarize https://example.com")
+    ///     .server_tool(ServerTool::web_fetch().with_max_uses(1))
+    ///     .send()
+    ///     .await?;
+    /// ```
+    pub fn server_tool(mut self, tool: ServerTool) -> Self {
+        let tools = self.tools.get_or_insert_with(Vec::new);
+        tools.push(ToolDefinition::Server(tool));
         self
     }
 
@@ -630,6 +650,49 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(req.service_tier.as_deref(), Some("standard_only"));
+    }
+
+    #[test]
+    fn build_with_server_tool() {
+        let client = test_client();
+        let req = client
+            .messages()
+            .model("m")
+            .max_tokens(1)
+            .user("Summarize https://example.com")
+            .server_tool(ServerTool::web_fetch().with_max_uses(1).with_max_content_tokens(5000))
+            .build()
+            .unwrap();
+
+        let tools = req.tools.unwrap();
+        assert_eq!(tools.len(), 1);
+        let json = serde_json::to_value(&tools[0]).unwrap();
+        assert_eq!(json["type"], "web_fetch_20250910");
+        assert_eq!(json["name"], "web_fetch");
+        assert_eq!(json["max_uses"], 1);
+        assert_eq!(json["max_content_tokens"], 5000);
+    }
+
+    #[test]
+    fn build_with_mixed_tools() {
+        let client = test_client();
+        let req = client
+            .messages()
+            .model("m")
+            .max_tokens(1)
+            .user("x")
+            .tool(Tool {
+                name: "calc".into(),
+                description: "Calculator".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                cache_control: None,
+            })
+            .server_tool(ServerTool::web_fetch().with_max_uses(1))
+            .build()
+            .unwrap();
+
+        let tools = req.tools.unwrap();
+        assert_eq!(tools.len(), 2);
     }
 
     #[test]
