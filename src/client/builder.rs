@@ -25,7 +25,7 @@ use crate::client::ClaudeClient;
 use crate::error::ClaudeError;
 use crate::streaming::SseStream;
 use crate::types::{
-    CacheControl, ContentBlock, CreateMessageRequest, CreateMessageResponse, Message,
+    CacheControl, ContentBlock, CreateMessageRequest, CreateMessageResponse, EffortLevel, Message,
     MessageContent, Metadata, OutputConfig, OutputFormat, Role, ServerTool, SystemPrompt,
     ThinkingConfig, Tool, ToolChoice, ToolDefinition,
 };
@@ -313,14 +313,14 @@ impl<'a> MessageBuilder<'a> {
         self
     }
 
-    /// Set the reasoning effort level (`"low"`, `"medium"`, `"high"`, `"max"`).
+    /// Set how much effort Claude spends on output, tool calls, and thinking.
     #[must_use]
-    pub fn effort(mut self, effort: &str) -> Self {
+    pub fn effort(mut self, effort: EffortLevel) -> Self {
         let config = self.output_config.get_or_insert(OutputConfig {
             effort: None,
             format: None,
         });
-        config.effort = Some(effort.to_string());
+        config.effort = Some(effort);
         self
     }
 
@@ -671,11 +671,11 @@ mod tests {
             .model("m")
             .max_tokens(1)
             .user("x")
-            .effort("high")
+            .effort(EffortLevel::High)
             .build()
             .unwrap();
 
-        assert_eq!(req.output_config.unwrap().effort.as_deref(), Some("high"));
+        assert_eq!(req.output_config.unwrap().effort, Some(EffortLevel::High));
     }
 
     #[test]

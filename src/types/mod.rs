@@ -3,6 +3,7 @@
 pub mod batch;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::str::FromStr;
 
 // ---------------------------------------------------------------------------
 // Role
@@ -505,12 +506,61 @@ pub struct Metadata {
 // OutputConfig
 // ---------------------------------------------------------------------------
 
+/// Controls how many tokens Claude spends on a response.
+///
+/// Effort affects visible output, tool calls, and adaptive thinking. It is a
+/// behavioral signal rather than a hard token or monetary budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EffortLevel {
+    /// Lowest latency and token use.
+    Low,
+    /// Balanced capability, latency, and token use.
+    Medium,
+    /// Deep reasoning and the API default when effort is omitted.
+    High,
+    /// Extended effort for supported long-horizon agentic workloads.
+    #[serde(rename = "xhigh")]
+    XHigh,
+    /// Maximum capability without an effort-based token constraint.
+    Max,
+}
+
+impl EffortLevel {
+    /// Return the Claude API and CLI wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+impl FromStr for EffortLevel {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::XHigh),
+            "max" => Ok(Self::Max),
+            _ => Err("expected low, medium, high, xhigh, or max"),
+        }
+    }
+}
+
 /// Configuration for output format and effort level.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputConfig {
-    /// Reasoning effort: `"low"`, `"medium"`, `"high"`, or `"max"`.
+    /// Reasoning effort for this request.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
+    pub effort: Option<EffortLevel>,
 
     /// Structured output format (e.g. JSON schema).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1306,12 +1356,28 @@ mod tests {
     #[test]
     fn output_config_effort_only() {
         let oc = OutputConfig {
-            effort: Some("high".into()),
+            effort: Some(EffortLevel::High),
             format: None,
         };
         let json = serde_json::to_value(&oc).unwrap();
         assert_eq!(json["effort"], "high");
         assert!(json.get("format").is_none());
+    }
+
+    #[test]
+    fn effort_levels_round_trip_wire_values() {
+        for (wire, level) in [
+            ("low", EffortLevel::Low),
+            ("medium", EffortLevel::Medium),
+            ("high", EffortLevel::High),
+            ("xhigh", EffortLevel::XHigh),
+            ("max", EffortLevel::Max),
+        ] {
+            assert_eq!(wire.parse::<EffortLevel>().unwrap(), level);
+            assert_eq!(serde_json::to_value(level).unwrap(), wire);
+            assert_eq!(level.as_str(), wire);
+        }
+        assert!("extreme".parse::<EffortLevel>().is_err());
     }
 
     #[test]

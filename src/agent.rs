@@ -6,6 +6,7 @@
 //! and in-process MCP tool dispatch.
 
 use crate::error::ClaudeError;
+use crate::types::EffortLevel;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -96,6 +97,11 @@ pub struct AgentOptions {
     pub model: Option<String>,
     /// Fallback model or model alias.
     pub fallback_model: Option<String>,
+    /// Effort applied to model output, tool calls, and adaptive thinking.
+    ///
+    /// `None` preserves Claude Code's default (`high`). `XHigh` and `Max`
+    /// support is model-dependent.
+    pub effort: Option<EffortLevel>,
     /// Maximum agent turns for one invocation.
     pub max_turns: Option<u32>,
     /// Maximum API spend for one invocation.
@@ -145,6 +151,7 @@ impl Default for AgentOptions {
             permission_mode: PermissionMode::DontAsk,
             model: None,
             fallback_model: None,
+            effort: None,
             max_turns: Some(24),
             max_budget_usd: None,
             cwd: None,

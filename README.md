@@ -326,6 +326,25 @@ let response = client
     .await?;
 ```
 
+### Effort
+
+Effort is a behavioral signal that controls token use across text, tool calls,
+and adaptive thinking. `High` is equivalent to omitting the parameter. Use
+`max_tokens` and application-level spend limits for hard bounds.
+
+```rust
+use claude_agent_rust_sdk::EffortLevel;
+
+let response = client
+    .messages()
+    .model(models::CLAUDE_SONNET_5)
+    .max_tokens(16_000)
+    .effort(EffortLevel::Medium)
+    .user("Diagnose this CI failure.")
+    .send()
+    .await?;
+```
+
 ### Tool Use
 
 Define tools the model can call:

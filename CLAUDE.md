@@ -20,9 +20,10 @@ src/
   types/
     mod.rs            -- API request/response types: CreateMessageRequest, CreateMessageResponse,
                          ContentBlock, ResponseContentBlock, Usage, CacheControl, StreamEvent,
-                         ContentDelta, ThinkingConfig, ToolChoice, Tool, ToolDefinition,
-                         Citation, DocumentSource, ImageSource, CountTokensRequest/Response,
-                         OutputConfig, OutputFormat, Metadata. All derive Serialize/Deserialize.
+                         ContentDelta, ThinkingConfig, EffortLevel, ToolChoice, Tool,
+                         ToolDefinition, Citation, DocumentSource, ImageSource,
+                         CountTokensRequest/Response, OutputConfig, OutputFormat, Metadata.
+                         All derive Serialize/Deserialize where appropriate.
     batch.rs          -- Batch-specific types: BatchRequest, BatchResponse, BatchResult,
                          BatchResultBody, BatchStatus, ListBatchesResponse, ListBatchesParams.
                          Maps to /v1/messages/batches JSON.

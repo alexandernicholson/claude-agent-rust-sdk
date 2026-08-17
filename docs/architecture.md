@@ -255,6 +255,9 @@ Key builder methods by category:
 | Other | `stream()`, `cache_control()`, `metadata()`, `service_tier()` |
 | Send | `build()`, `send()`, `send_stream()` |
 
+`EffortLevel` accepts `Low`, `Medium`, `High`, `XHigh`, and `Max`. Effort is a
+soft behavioral signal; `max_tokens` remains the request's hard output limit.
+
 ---
 
 ## Batch Processing Lifecycle
