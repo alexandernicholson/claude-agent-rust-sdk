@@ -1,4 +1,9 @@
-#![deny(clippy::all, clippy::pedantic, missing_debug_implementations, unused_must_use)]
+#![deny(
+    clippy::all,
+    clippy::pedantic,
+    missing_debug_implementations,
+    unused_must_use
+)]
 
 //! Unofficial Rust SDK for the [Claude API](https://platform.claude.com/docs/en/api/messages)
 //! by Anthropic.
@@ -118,8 +123,9 @@
 //!         &self,
 //!         request: &CreateMessageRequest,
 //!     ) -> Result<CreateMessageResponse, ClaudeError> {
-//!         // custom implementation
-//!         todo!()
+//!         Err(ClaudeError::Unsupported(
+//!             "MyTransport does not implement message creation".into(),
+//!         ))
 //!     }
 //! }
 //!
@@ -138,6 +144,7 @@
 //! - [`error`] -- [`ClaudeError`](error::ClaudeError) enum.
 //! - [`models`] -- Model ID constants for all Claude model families.
 
+pub mod agent;
 pub mod batch;
 pub mod client;
 pub mod error;

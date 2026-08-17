@@ -8,9 +8,7 @@ use std::time::Duration;
 
 use claude_agent_rust_sdk::client::ClaudeClient;
 use claude_agent_rust_sdk::types::batch::{BatchRequest, BatchResultBody, CreateBatchRequest};
-use claude_agent_rust_sdk::types::{
-    CreateMessageRequest, Message, MessageContent, Role,
-};
+use claude_agent_rust_sdk::types::{CreateMessageRequest, Message, MessageContent, Role};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -22,7 +20,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = ClaudeClient::new(&api_key);
 
     // Build a batch of three translation requests.
-    let languages = [("French", "Bonjour!"), ("Spanish", "Hola!"), ("German", "Guten Tag!")];
+    let languages = [
+        ("French", "Bonjour!"),
+        ("Spanish", "Hola!"),
+        ("German", "Guten Tag!"),
+    ];
 
     let requests: Vec<BatchRequest> = languages
         .iter()

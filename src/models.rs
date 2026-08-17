@@ -91,8 +91,7 @@ mod tests {
             assert!(!model.is_empty(), "Model constant should not be empty");
             assert!(
                 model.contains("claude"),
-                "Model constant should contain 'claude': {}",
-                model
+                "Model constant should contain 'claude': {model}"
             );
         }
     }

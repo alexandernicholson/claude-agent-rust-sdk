@@ -36,10 +36,7 @@ pub enum ClaudeError {
 
     /// An error received inside a streaming event.
     #[error("Stream error: [{error_type}] {message}")]
-    StreamError {
-        error_type: String,
-        message: String,
-    },
+    StreamError { error_type: String, message: String },
 
     /// The transport does not support this operation.
     #[error("Unsupported operation: {0}")]
@@ -66,7 +63,7 @@ mod tests {
             error_type: "rate_limit_error".into(),
             message: "Too many requests".into(),
         };
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("429"));
         assert!(msg.contains("rate_limit_error"));
         assert!(msg.contains("Too many requests"));
@@ -77,7 +74,7 @@ mod tests {
         let err = ClaudeError::BatchTimeout {
             batch_id: "batch_123".into(),
         };
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("batch_123"));
         assert!(msg.contains("timed out"));
     }
@@ -85,7 +82,7 @@ mod tests {
     #[test]
     fn invalid_config_display() {
         let err = ClaudeError::InvalidConfig("model is required".into());
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("model is required"));
     }
 
@@ -95,7 +92,7 @@ mod tests {
             error_type: "overloaded_error".into(),
             message: "Overloaded".into(),
         };
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("overloaded_error"));
         assert!(msg.contains("Overloaded"));
     }
@@ -127,7 +124,7 @@ mod tests {
             },
         ];
         for err in errs {
-            let debug = format!("{:?}", err);
+            let debug = format!("{err:?}");
             assert!(!debug.is_empty());
         }
     }
@@ -150,7 +147,7 @@ mod tests {
                 error_type: error_type.into(),
                 message: "test".into(),
             };
-            let msg = format!("{}", err);
+            let msg = format!("{err}");
             assert!(msg.contains(&status.to_string()));
             assert!(msg.contains(error_type));
         }

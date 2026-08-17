@@ -71,18 +71,11 @@ impl CacheControl {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImageSource {
     /// Base-64 encoded image data.
-    Base64 {
-        media_type: String,
-        data: String,
-    },
+    Base64 { media_type: String, data: String },
     /// A publicly-accessible URL.
-    Url {
-        url: String,
-    },
+    Url { url: String },
     /// A file uploaded via the Files API.
-    File {
-        file_id: String,
-    },
+    File { file_id: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -94,23 +87,13 @@ pub enum ImageSource {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DocumentSource {
     /// Base-64 encoded document data (e.g. PDF).
-    Base64 {
-        media_type: String,
-        data: String,
-    },
+    Base64 { media_type: String, data: String },
     /// Plain text content.
-    Text {
-        media_type: String,
-        data: String,
-    },
+    Text { media_type: String, data: String },
     /// A publicly-accessible URL.
-    Url {
-        url: String,
-    },
+    Url { url: String },
     /// Content block array.
-    Content {
-        content: DocumentContentData,
-    },
+    Content { content: DocumentContentData },
 }
 
 /// The content field inside a `DocumentSource::Content` variant.
@@ -181,15 +164,10 @@ pub enum ContentBlock {
         cache_control: Option<CacheControl>,
     },
     /// A thinking block from extended thinking (passed back in multi-turn).
-    Thinking {
-        thinking: String,
-        signature: String,
-    },
+    Thinking { thinking: String, signature: String },
     /// A redacted thinking block (opaque, passed back in multi-turn).
     #[serde(rename = "redacted_thinking")]
-    RedactedThinking {
-        data: String,
-    },
+    RedactedThinking { data: String },
 }
 
 /// The content of a tool result -- either a plain string or an array of blocks.
@@ -474,9 +452,9 @@ impl<'de> Deserialize<'de> for ToolChoice {
             "any" => Ok(ToolChoice::Any),
             "none" => Ok(ToolChoice::None),
             "tool" => {
-                let name = raw.name.ok_or_else(|| {
-                    serde::de::Error::missing_field("name")
-                })?;
+                let name = raw
+                    .name
+                    .ok_or_else(|| serde::de::Error::missing_field("name"))?;
                 Ok(ToolChoice::Tool { name })
             }
             other => Err(serde::de::Error::unknown_variant(
@@ -544,9 +522,7 @@ pub struct OutputConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OutputFormat {
     /// Require the model to produce valid JSON matching a schema.
-    JsonSchema {
-        schema: serde_json::Value,
-    },
+    JsonSchema { schema: serde_json::Value },
 }
 
 // ---------------------------------------------------------------------------
@@ -642,9 +618,7 @@ pub enum ResponseContentBlock {
     },
     /// Redacted thinking content (opaque).
     #[serde(rename = "redacted_thinking")]
-    RedactedThinking {
-        data: String,
-    },
+    RedactedThinking { data: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -837,10 +811,9 @@ pub struct CountTokensResponse {
 
 /// Shape of an error body returned by the Claude API.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub(crate) struct ApiErrorBody {
     #[serde(rename = "type")]
-    pub error_type: String,
+    pub _error_type: String,
     pub error: ApiErrorDetail,
 }
 
@@ -860,23 +833,16 @@ pub(crate) struct ApiErrorDetail {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
     /// The start of a message, containing the initial `Message` object.
-    MessageStart {
-        message: CreateMessageResponse,
-    },
+    MessageStart { message: CreateMessageResponse },
     /// The start of a content block.
     ContentBlockStart {
         index: u32,
         content_block: StreamContentBlock,
     },
     /// A delta update to a content block.
-    ContentBlockDelta {
-        index: u32,
-        delta: ContentDelta,
-    },
+    ContentBlockDelta { index: u32, delta: ContentDelta },
     /// The end of a content block.
-    ContentBlockStop {
-        index: u32,
-    },
+    ContentBlockStop { index: u32 },
     /// A delta update to the top-level message (`stop_reason`, usage).
     MessageDelta {
         delta: MessageDeltaData,
@@ -888,9 +854,7 @@ pub enum StreamEvent {
     /// A keepalive ping.
     Ping {},
     /// An error event in the stream.
-    Error {
-        error: StreamError,
-    },
+    Error { error: StreamError },
 }
 
 /// A content block stub at the start of streaming.
@@ -898,9 +862,7 @@ pub enum StreamEvent {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamContentBlock {
     /// A text content block (starts empty).
-    Text {
-        text: String,
-    },
+    Text { text: String },
     /// A tool use content block.
     ToolUse {
         id: String,
@@ -908,9 +870,7 @@ pub enum StreamContentBlock {
         input: serde_json::Value,
     },
     /// A thinking content block.
-    Thinking {
-        thinking: String,
-    },
+    Thinking { thinking: String },
 }
 
 /// Delta types for streaming content blocks.
@@ -918,21 +878,13 @@ pub enum StreamContentBlock {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentDelta {
     /// Incremental text.
-    TextDelta {
-        text: String,
-    },
+    TextDelta { text: String },
     /// Incremental JSON for tool input.
-    InputJsonDelta {
-        partial_json: String,
-    },
+    InputJsonDelta { partial_json: String },
     /// Incremental thinking text.
-    ThinkingDelta {
-        thinking: String,
-    },
+    ThinkingDelta { thinking: String },
     /// A signature for a thinking block.
-    SignatureDelta {
-        signature: String,
-    },
+    SignatureDelta { signature: String },
 }
 
 /// Top-level message delta (`stop_reason`, `stop_sequence`).
@@ -1076,7 +1028,7 @@ mod tests {
         let back: DocumentSource = serde_json::from_value(json).unwrap();
         match back {
             DocumentSource::Base64 { media_type, .. } => {
-                assert_eq!(media_type, "application/pdf")
+                assert_eq!(media_type, "application/pdf");
             }
             _ => panic!("expected Base64"),
         }
@@ -1110,7 +1062,10 @@ mod tests {
         assert!(json.get("cache_control").is_none());
         let back: ContentBlock = serde_json::from_value(json).unwrap();
         match back {
-            ContentBlock::Text { text, cache_control } => {
+            ContentBlock::Text {
+                text,
+                cache_control,
+            } => {
                 assert_eq!(text, "Hello");
                 assert!(cache_control.is_none());
             }
@@ -1167,7 +1122,9 @@ mod tests {
         assert_eq!(json["citations"]["enabled"], true);
         let back: ContentBlock = serde_json::from_value(json).unwrap();
         match back {
-            ContentBlock::Document { title, citations, .. } => {
+            ContentBlock::Document {
+                title, citations, ..
+            } => {
                 assert_eq!(title.as_deref(), Some("test.pdf"));
                 assert!(citations.unwrap().enabled);
             }
@@ -1221,7 +1178,10 @@ mod tests {
         assert_eq!(json["signature"], "sig123");
         let back: ContentBlock = serde_json::from_value(json).unwrap();
         match back {
-            ContentBlock::Thinking { thinking, signature } => {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
                 assert_eq!(thinking, "Let me think...");
                 assert_eq!(signature, "sig123");
             }
@@ -1325,7 +1285,7 @@ mod tests {
         let back: ThinkingConfig = serde_json::from_value(json).unwrap();
         match back {
             ThinkingConfig::Adaptive { budget_tokens } => {
-                assert_eq!(budget_tokens, Some(5000))
+                assert_eq!(budget_tokens, Some(5000));
             }
             _ => panic!("expected Adaptive"),
         }
@@ -1377,7 +1337,7 @@ mod tests {
         let back: MessageContent = serde_json::from_str(&json).unwrap();
         match back {
             MessageContent::Text(t) => assert_eq!(t, "Hello"),
-            _ => panic!("expected Text"),
+            MessageContent::Blocks(_) => panic!("expected Text"),
         }
     }
 
@@ -1392,7 +1352,7 @@ mod tests {
         let back: MessageContent = serde_json::from_value(json).unwrap();
         match back {
             MessageContent::Blocks(blocks) => assert_eq!(blocks.len(), 1),
-            _ => panic!("expected Blocks"),
+            MessageContent::Text(_) => panic!("expected Blocks"),
         }
     }
 
@@ -1512,8 +1472,7 @@ mod tests {
 
     #[test]
     fn server_tool_with_allowed_domains() {
-        let tool = ServerTool::web_fetch()
-            .with_allowed_domains(vec!["example.com".into()]);
+        let tool = ServerTool::web_fetch().with_allowed_domains(vec!["example.com".into()]);
         assert_eq!(
             tool.allowed_domains.as_ref().unwrap(),
             &vec!["example.com".to_string()]
@@ -1522,8 +1481,7 @@ mod tests {
 
     #[test]
     fn server_tool_with_blocked_domains() {
-        let tool = ServerTool::web_fetch()
-            .with_blocked_domains(vec!["private.example.com".into()]);
+        let tool = ServerTool::web_fetch().with_blocked_domains(vec!["private.example.com".into()]);
         assert_eq!(
             tool.blocked_domains.as_ref().unwrap(),
             &vec!["private.example.com".to_string()]
@@ -1538,8 +1496,7 @@ mod tests {
 
     #[test]
     fn server_tool_with_allowed_callers() {
-        let tool = ServerTool::web_fetch()
-            .with_allowed_callers(vec!["summarize".into()]);
+        let tool = ServerTool::web_fetch().with_allowed_callers(vec!["summarize".into()]);
         assert_eq!(
             tool.allowed_callers.as_ref().unwrap(),
             &vec!["summarize".to_string()]
@@ -1596,9 +1553,7 @@ mod tests {
 
     #[test]
     fn tool_definition_server_serialization() {
-        let td = ToolDefinition::Server(
-            ServerTool::web_fetch().with_max_uses(1),
-        );
+        let td = ToolDefinition::Server(ServerTool::web_fetch().with_max_uses(1));
         let json = serde_json::to_value(&td).unwrap();
         assert_eq!(json["type"], "web_fetch_20250910");
         assert_eq!(json["name"], "web_fetch");
@@ -1617,9 +1572,7 @@ mod tests {
                 input_schema: serde_json::json!({"type": "object"}),
                 cache_control: None,
             }),
-            ToolDefinition::Server(
-                ServerTool::web_fetch().with_max_uses(1),
-            ),
+            ToolDefinition::Server(ServerTool::web_fetch().with_max_uses(1)),
         ];
         let json = serde_json::to_value(&tools).unwrap();
         let arr = json.as_array().unwrap();
@@ -1688,7 +1641,10 @@ mod tests {
         });
         let block: ResponseContentBlock = serde_json::from_value(json).unwrap();
         match block {
-            ResponseContentBlock::WebFetchToolResult { tool_use_id, content } => {
+            ResponseContentBlock::WebFetchToolResult {
+                tool_use_id,
+                content,
+            } => {
                 assert_eq!(tool_use_id, "srvtoolu_123");
                 assert_eq!(content, "Page content here");
             }
@@ -1842,7 +1798,7 @@ mod tests {
         let block: ResponseContentBlock = serde_json::from_value(json).unwrap();
         match block {
             ResponseContentBlock::RedactedThinking { data } => {
-                assert_eq!(data, "redacted_blob")
+                assert_eq!(data, "redacted_blob");
             }
             _ => panic!("expected RedactedThinking"),
         }
@@ -2193,10 +2149,7 @@ mod tests {
             "index": 0
         });
         let event: StreamEvent = serde_json::from_value(json).unwrap();
-        assert!(matches!(
-            event,
-            StreamEvent::ContentBlockStop { index: 0 }
-        ));
+        assert!(matches!(event, StreamEvent::ContentBlockStop { index: 0 }));
     }
 
     #[test]

@@ -25,6 +25,7 @@ use std::sync::Arc;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use tracing::debug;
 
+use crate::batch::BatchClient;
 use crate::error::ClaudeError;
 use crate::streaming::SseStream;
 use crate::transport::Transport;
@@ -32,7 +33,6 @@ use crate::types::{
     ApiErrorBody, CountTokensRequest, CountTokensResponse, CreateMessageRequest,
     CreateMessageResponse,
 };
-use crate::batch::BatchClient;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
@@ -352,19 +352,22 @@ impl ClaudeClient {
     pub(crate) fn build_headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            "anthropic-version",
-            HeaderValue::from_static(API_VERSION),
-        );
+        headers.insert("anthropic-version", HeaderValue::from_static(API_VERSION));
 
         match &self.auth {
             AuthMethod::ApiKey(key) => {
                 // unwrap is safe: API keys are ASCII.
-                headers.insert("x-api-key", HeaderValue::from_str(key).expect("invalid API key characters"));
+                headers.insert(
+                    "x-api-key",
+                    HeaderValue::from_str(key).expect("invalid API key characters"),
+                );
             }
             AuthMethod::BearerToken(token) => {
                 let value = format!("Bearer {token}");
-                headers.insert(AUTHORIZATION, HeaderValue::from_str(&value).expect("invalid token characters"));
+                headers.insert(
+                    AUTHORIZATION,
+                    HeaderValue::from_str(&value).expect("invalid token characters"),
+                );
             }
         }
 

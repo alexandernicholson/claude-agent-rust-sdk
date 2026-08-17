@@ -33,10 +33,7 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamEvent, ClaudeError>> {
         if data == "[DONE]" {
             return None;
         }
-        Some(
-            serde_json::from_str::<StreamEvent>(data)
-                .map_err(ClaudeError::SerializationError),
-        )
+        Some(serde_json::from_str::<StreamEvent>(data).map_err(ClaudeError::SerializationError))
     } else {
         // event: lines, id: lines, retry: lines -- skip them
         None
@@ -85,28 +82,25 @@ impl SseStream {
 fn async_stream(
     response: reqwest::Response,
 ) -> impl Stream<Item = Result<StreamEvent, ClaudeError>> + Send {
-    futures::stream::unfold(
-        StreamState::new(response),
-        |mut state| async move {
-            loop {
-                // If we have buffered lines, process the next one
-                if let Some(line) = state.next_buffered_line() {
-                    if let Some(result) = parse_sse_line(&line) {
-                        return Some((result, state));
-                    }
-                    // Line was empty/comment/event-type, skip
-                    continue;
+    futures::stream::unfold(StreamState::new(response), |mut state| async move {
+        loop {
+            // If we have buffered lines, process the next one
+            if let Some(line) = state.next_buffered_line() {
+                if let Some(result) = parse_sse_line(&line) {
+                    return Some((result, state));
                 }
-
-                // Read more bytes from the response
-                match state.read_chunk().await {
-                    Ok(true) => {},   // Got more data, loop again
-                    Ok(false) => return None, // Stream ended
-                    Err(e) => return Some((Err(e), state)),
-                }
+                // Line was empty/comment/event-type, skip
+                continue;
             }
-        },
-    )
+
+            // Read more bytes from the response
+            match state.read_chunk().await {
+                Ok(true) => {}            // Got more data, loop again
+                Ok(false) => return None, // Stream ended
+                Err(e) => return Some((Err(e), state)),
+            }
+        }
+    })
 }
 
 /// Internal state for the SSE stream unfold.
@@ -144,11 +138,7 @@ impl StreamState {
                 self.buffer.push_str(&text);
 
                 // Split on double newlines (SSE event boundaries) or single newlines
-                let lines: Vec<String> = self
-                    .buffer
-                    .split('\n')
-                    .map(ToString::to_string)
-                    .collect();
+                let lines: Vec<String> = self.buffer.split('\n').map(ToString::to_string).collect();
 
                 // The last element might be an incomplete line
                 if self.buffer.ends_with('\n') {
@@ -258,8 +248,7 @@ mod tests {
 
     #[test]
     fn parse_sse_line_text_delta() {
-        let line =
-            r#"data: {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hello"}}"#;
+        let line = r#"data: {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hello"}}"#;
         let result = parse_sse_line(line).unwrap().unwrap();
         match result {
             StreamEvent::ContentBlockDelta {
@@ -313,10 +302,7 @@ mod tests {
     fn parse_sse_line_content_block_stop() {
         let line = r#"data: {"type": "content_block_stop", "index": 0}"#;
         let result = parse_sse_line(line).unwrap().unwrap();
-        assert!(matches!(
-            result,
-            StreamEvent::ContentBlockStop { index: 0 }
-        ));
+        assert!(matches!(result, StreamEvent::ContentBlockStop { index: 0 }));
     }
 
     #[test]
@@ -341,8 +327,7 @@ mod tests {
 
     #[test]
     fn parse_sse_line_error_event() {
-        let line =
-            r#"data: {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}"#;
+        let line = r#"data: {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}"#;
         let result = parse_sse_line(line).unwrap().unwrap();
         match result {
             StreamEvent::Error { error } => {
@@ -354,7 +339,7 @@ mod tests {
 
     #[test]
     fn parse_sse_line_malformed_json() {
-        let line = r#"data: {not valid json}"#;
+        let line = r"data: {not valid json}";
         let result = parse_sse_line(line);
         assert!(result.is_some());
         assert!(result.unwrap().is_err());

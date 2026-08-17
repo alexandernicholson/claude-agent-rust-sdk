@@ -461,7 +461,11 @@ mod tests {
     #[test]
     fn build_fails_without_max_tokens() {
         let client = test_client();
-        let result = client.messages().model("claude-haiku-4-5").user("Hi").build();
+        let result = client
+            .messages()
+            .model("claude-haiku-4-5")
+            .user("Hi")
+            .build();
         assert!(result.is_err());
     }
 
@@ -590,7 +594,7 @@ mod tests {
 
         match req.thinking {
             Some(ThinkingConfig::Enabled { budget_tokens }) => {
-                assert_eq!(budget_tokens, 10000)
+                assert_eq!(budget_tokens, 10000);
             }
             _ => panic!("expected Enabled thinking"),
         }
@@ -610,7 +614,7 @@ mod tests {
 
         match req.thinking {
             Some(ThinkingConfig::Adaptive { budget_tokens }) => {
-                assert_eq!(budget_tokens, Some(5000))
+                assert_eq!(budget_tokens, Some(5000));
             }
             _ => panic!("expected Adaptive thinking"),
         }
@@ -720,7 +724,11 @@ mod tests {
             .model("m")
             .max_tokens(1)
             .user("Summarize https://example.com")
-            .server_tool(ServerTool::web_fetch().with_max_uses(1).with_max_content_tokens(5000))
+            .server_tool(
+                ServerTool::web_fetch()
+                    .with_max_uses(1)
+                    .with_max_content_tokens(5000),
+            )
             .build()
             .unwrap();
 
@@ -813,7 +821,7 @@ mod tests {
 
         match &req.messages[0].content {
             MessageContent::Blocks(b) => assert_eq!(b.len(), 2),
-            _ => panic!("expected Blocks"),
+            MessageContent::Text(_) => panic!("expected Blocks"),
         }
     }
 

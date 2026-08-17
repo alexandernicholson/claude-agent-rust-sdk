@@ -35,8 +35,8 @@ use tracing::debug;
 use crate::client::ClaudeClient;
 use crate::error::ClaudeError;
 use crate::types::batch::{
-    BatchResponse, BatchResult, BatchStatus, CreateBatchRequest,
-    ListBatchesParams, ListBatchesResponse,
+    BatchResponse, BatchResult, BatchStatus, CreateBatchRequest, ListBatchesParams,
+    ListBatchesResponse,
 };
 
 /// Client for creating and managing message batches.
@@ -61,10 +61,7 @@ impl<'a> BatchClient<'a> {
     /// Returns [`ClaudeError::ApiError`] if the API returns a non-success status,
     /// [`ClaudeError::NetworkError`] on connection failures, or
     /// [`ClaudeError::SerializationError`] if the response cannot be parsed.
-    pub async fn create(
-        &self,
-        request: &CreateBatchRequest,
-    ) -> Result<BatchResponse, ClaudeError> {
+    pub async fn create(&self, request: &CreateBatchRequest) -> Result<BatchResponse, ClaudeError> {
         if let Some(transport) = self.client.transport() {
             return transport.create_batch(request).await;
         }
@@ -109,13 +106,7 @@ impl<'a> BatchClient<'a> {
 
         debug!(url = %url, "retrieving batch");
 
-        let response = self
-            .client
-            .http()
-            .get(&url)
-            .headers(headers)
-            .send()
-            .await?;
+        let response = self.client.http().get(&url).headers(headers).send().await?;
 
         Self::handle_response(response).await
     }
@@ -161,13 +152,7 @@ impl<'a> BatchClient<'a> {
 
         debug!(url = %url, "listing batches");
 
-        let response = self
-            .client
-            .http()
-            .get(&url)
-            .headers(headers)
-            .send()
-            .await?;
+        let response = self.client.http().get(&url).headers(headers).send().await?;
 
         Self::handle_response(response).await
     }
@@ -255,16 +240,16 @@ impl<'a> BatchClient<'a> {
         poll_interval: Duration,
     ) -> Result<BatchResponse, ClaudeError> {
         if let Some(transport) = self.client.transport() {
-            return transport.poll_batch_until_complete(batch_id, poll_interval).await;
+            return transport
+                .poll_batch_until_complete(batch_id, poll_interval)
+                .await;
         }
 
         // Safety cap: stop polling after 24 hours.
         // The result always fits in u64 since 24h / 1ms = 86_400_000.
-        let max_iterations = u64::try_from(
-            Duration::from_secs(24 * 60 * 60).as_millis()
-                / poll_interval.as_millis().max(1),
-        )
-        .unwrap_or(u64::MAX);
+        let max_iterations =
+            u64::try_from(Duration::from_hours(24).as_millis() / poll_interval.as_millis().max(1))
+                .unwrap_or(u64::MAX);
 
         for _ in 0..max_iterations {
             let batch = self.retrieve(batch_id).await?;

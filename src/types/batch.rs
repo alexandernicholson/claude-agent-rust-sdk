@@ -125,7 +125,9 @@ pub struct BatchError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BatchResultBody {
-    Succeeded { message: CreateMessageResponse },
+    Succeeded {
+        message: CreateMessageResponse,
+    },
     Errored {
         #[serde(default)]
         error: Option<BatchError>,

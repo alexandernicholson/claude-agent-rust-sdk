@@ -38,12 +38,12 @@ use async_trait::async_trait;
 
 use crate::error::ClaudeError;
 use crate::streaming::SseStream;
-use crate::types::{
-    CountTokensRequest, CountTokensResponse, CreateMessageRequest, CreateMessageResponse,
-};
 use crate::types::batch::{
     BatchResponse, BatchResult, BatchStatus, CreateBatchRequest, ListBatchesParams,
     ListBatchesResponse,
+};
+use crate::types::{
+    CountTokensRequest, CountTokensResponse, CreateMessageRequest, CreateMessageResponse,
 };
 
 /// Trait abstracting how Claude API operations are executed.
@@ -132,11 +132,9 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
         poll_interval: Duration,
     ) -> Result<BatchResponse, ClaudeError> {
         // The result always fits in u64 since 24h / 1ms = 86_400_000.
-        let max_iterations = u64::try_from(
-            Duration::from_secs(24 * 60 * 60).as_millis()
-                / poll_interval.as_millis().max(1),
-        )
-        .unwrap_or(u64::MAX);
+        let max_iterations =
+            u64::try_from(Duration::from_hours(24).as_millis() / poll_interval.as_millis().max(1))
+                .unwrap_or(u64::MAX);
 
         for _ in 0..max_iterations {
             let batch = self.retrieve_batch(batch_id).await?;
