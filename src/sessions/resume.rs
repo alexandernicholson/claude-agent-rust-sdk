@@ -1,6 +1,6 @@
 //! Materialize a [`SessionStore`]-backed resume into a temp `CLAUDE_CONFIG_DIR`.
 //!
-//! When [`AgentOptions::session_store`](crate::AgentOptions) is set together
+//! When [`AgentOptions::session_store`](crate::agent::AgentOptions) is set together
 //! with `resume` or `continue_conversation`, the transcript for the resolved
 //! session is loaded from the store and written to a temporary directory laid
 //! out like `~/.claude/`. The subprocess runs with

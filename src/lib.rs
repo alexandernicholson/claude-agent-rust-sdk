@@ -141,7 +141,7 @@
 //! - [`streaming`] -- [`SseStream`](streaming::SseStream) and SSE parsing.
 //! - [`types`] -- All request/response types, content blocks, tools, citations,
 //!   and streaming events.
-//! - [`error`] -- [`ClaudeError`](error::ClaudeError) enum.
+//! - [`error`] -- [`ClaudeError`] enum.
 //! - [`models`] -- Model ID constants for all Claude model families.
 
 pub mod agent;

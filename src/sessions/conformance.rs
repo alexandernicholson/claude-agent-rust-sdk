@@ -2,7 +2,8 @@
 //!
 //! Ported from the official Python Agent SDK
 //! (`testing/session_store_conformance.py`). Any adapter can be validated by
-//! calling [`run_conformance`] with a fresh-store factory. Contracts that
+//! calling [`run_conformance`](crate::sessions::conformance::run_conformance)
+//! with a fresh-store factory. Contracts that
 //! require an optional capability are skipped when the store does not advertise
 //! it (via [`SessionStore::capabilities`]).
 //!

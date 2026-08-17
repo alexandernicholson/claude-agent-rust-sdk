@@ -1,4 +1,5 @@
-//! Incremental session-summary derivation for [`SessionStore`] adapters.
+//! Incremental session-summary derivation for
+//! [`SessionStore`](crate::sessions::SessionStore) adapters.
 //!
 //! [`fold_session_summary`] lets a store maintain a per-session
 //! [`SessionSummaryEntry`] sidecar incrementally inside `append()` so a
