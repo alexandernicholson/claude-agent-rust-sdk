@@ -346,11 +346,12 @@ CountTokensResponse { input_tokens }
 
 ## Model Constants
 
-The `models` module provides `&str` constants for all current model IDs:
+The `models` module provides `&str` constants for current model IDs:
 
 ```rust
-pub const CLAUDE_OPUS_4_6: &str = "claude-opus-4-6";
-pub const CLAUDE_SONNET_4_6: &str = "claude-sonnet-4-6";
-pub const CLAUDE_HAIKU_4_5: &str = "claude-haiku-4-5";
-// ... and date-pinned variants
+pub const CLAUDE_FABLE_5: &str = "claude-fable-5";
+pub const CLAUDE_MYTHOS_5: &str = "claude-mythos-5";
+pub const CLAUDE_OPUS_5: &str = "claude-opus-5";
+pub const CLAUDE_SONNET_5: &str = "claude-sonnet-5";
+// ... and legacy snapshots
 ```

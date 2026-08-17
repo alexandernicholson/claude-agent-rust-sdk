@@ -588,23 +588,23 @@ The SDK is organized around these core components:
 
 - **Error handling** (`src/error.rs`) -- a single `ClaudeError` enum covering API errors, network errors, serialization errors, batch timeouts, invalid config, stream errors, unsupported operations, and transport errors.
 
-- **Model constants** (`src/models.rs`) -- `&str` constants for all current Claude model IDs (Opus, Sonnet, Haiku families with date-pinned variants).
+- **Model constants** (`src/models.rs`) -- `&str` constants for current Fable, Mythos, Opus, Sonnet, and Haiku model IDs.
 
 ---
 
 ## Model Constants
 
-The `models` module provides constants for all current model IDs:
+The `models` module provides constants for current model IDs:
 
 ```rust
 use claude_agent_rust_sdk::models;
 
-models::CLAUDE_OPUS_4_6       // "claude-opus-4-6"
-models::CLAUDE_SONNET_4_6     // "claude-sonnet-4-6"
-models::CLAUDE_HAIKU_4_5      // "claude-haiku-4-5"
-models::CLAUDE_OPUS_4_5       // "claude-opus-4-5-20251101"
-models::CLAUDE_SONNET_4_5     // "claude-sonnet-4-5-20250929"
-// ... and more
+models::CLAUDE_FABLE_5          // "claude-fable-5"
+models::CLAUDE_MYTHOS_5         // "claude-mythos-5"
+models::CLAUDE_OPUS_5           // "claude-opus-5"
+models::CLAUDE_SONNET_5         // "claude-sonnet-5"
+models::CLAUDE_HAIKU_4_5        // "claude-haiku-4-5"
+// ... and legacy snapshots
 ```
 
 You can also pass any model ID string directly.
@@ -615,8 +615,15 @@ You can also pass any model ID string directly.
 
 | Constant | Model ID | Description |
 |----------|----------|-------------|
-| `CLAUDE_OPUS_4_6` | `claude-opus-4-6` | Most intelligent model -- best for agents and complex coding |
-| `CLAUDE_SONNET_4_6` | `claude-sonnet-4-6` | Best balance of speed and intelligence |
+| `CLAUDE_FABLE_5` | `claude-fable-5` | Most capable widely released model for long-running agents |
+| `CLAUDE_MYTHOS_5` | `claude-mythos-5` | Limited-availability defensive cybersecurity model |
+| `CLAUDE_MYTHOS_PREVIEW` | `claude-mythos-preview` | Invitation-only Mythos preview |
+| `CLAUDE_OPUS_5` | `claude-opus-5` | Complex agentic coding and enterprise work |
+| `CLAUDE_SONNET_5` | `claude-sonnet-5` | Current speed and intelligence balance |
+| `CLAUDE_OPUS_4_8` | `claude-opus-4-8` | Legacy adaptive-thinking Opus snapshot |
+| `CLAUDE_OPUS_4_7` | `claude-opus-4-7` | Legacy adaptive-thinking Opus snapshot |
+| `CLAUDE_OPUS_4_6` | `claude-opus-4-6` | Legacy adaptive-thinking Opus snapshot |
+| `CLAUDE_SONNET_4_6` | `claude-sonnet-4-6` | Legacy adaptive-thinking Sonnet snapshot |
 | `CLAUDE_HAIKU_4_5` | `claude-haiku-4-5` | Fastest model with near-frontier intelligence |
 | `CLAUDE_OPUS_4_5` | `claude-opus-4-5-20251101` | Opus 4.5, date-pinned |
 | `CLAUDE_OPUS_4_1` | `claude-opus-4-1-20250805` | Opus 4.1, date-pinned |

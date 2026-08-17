@@ -13,8 +13,8 @@ src/
   lib.rs              -- Crate root. Re-exports public types from all modules.
   error.rs            -- ClaudeError enum (ApiError, NetworkError, SerializationError,
                          BatchTimeout, InvalidConfig, StreamError). Uses thiserror for Display/From.
-  models.rs           -- Model ID constants (CLAUDE_OPUS_4_6, CLAUDE_SONNET_4_6,
-                         CLAUDE_HAIKU_4_5, etc.) for all current Claude models.
+  models.rs           -- Model ID constants (CLAUDE_FABLE_5, CLAUDE_MYTHOS_5,
+                         CLAUDE_OPUS_5, CLAUDE_SONNET_5, and legacy snapshots).
   streaming.rs        -- SSE event parsing (parse_sse_line) and SseStream async Stream type.
                          Handles chunked SSE responses from reqwest byte streams.
   types/
