@@ -1,6 +1,6 @@
 # claude-agent-rust-sdk
 
-> **Unofficial** Rust SDK for the [Claude API](https://platform.claude.com/docs/en/api/messages) by Anthropic.
+> **Unofficial** Rust SDK for the [Claude API](https://platform.claude.com/docs/en/api/messages) and Claude Code agents by Anthropic.
 >
 > This is a community-maintained project and is not affiliated with or endorsed by Anthropic.
 
@@ -13,7 +13,10 @@
 
 ## Overview
 
-A typed, ergonomic Rust client for the Claude Messages API. Built on `reqwest` and `serde`, it provides:
+A typed Rust client for both the Claude Messages API and the bidirectional Claude Code Agent SDK protocol. Built on `reqwest`, `serde`, and Tokio, it provides:
+
+- **Claude Code agents** -- typed NDJSON messages, streaming turns, control requests, session resume, hooks, skills, plugins, subagents, and in-process MCP tools
+- **Session persistence** -- filesystem-compatible query, import, mutation, fork, resume, and pluggable `SessionStore` APIs
 
 - **Messages API** -- create single-turn and multi-turn conversations
 - **Streaming** -- async stream of SSE events with typed deltas
@@ -39,7 +42,7 @@ Add the dependency to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-claude-agent-rust-sdk = "0.1"
+claude-agent-rust-sdk = "0.4"
 ```
 
 Or reference the Git repository directly:
@@ -54,6 +57,37 @@ The crate pulls in `reqwest`, `serde`, `tokio`, and `thiserror` transitively. Yo
 ---
 
 ## Quick Start
+
+### Run a Claude Code agent
+
+Agent clients are transport-independent. Pair the SDK with
+[`claude-cli-transport`](https://github.com/alexandernicholson/claude-cli-transport)
+to run against Claude Code 2.0 or newer:
+
+```rust
+use claude_agent_rust_sdk::agent::{AgentOptions, ClaudeAgentClient};
+use claude_cli_transport::ClaudeCliAgentTransport;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let options = AgentOptions {
+        max_turns: Some(12),
+        max_budget_usd: Some(1.0),
+        ..AgentOptions::default()
+    };
+    let mut client = ClaudeAgentClient::new(ClaudeCliAgentTransport::new(), options);
+    client.connect().await?;
+    let result = client.query("Diagnose the failing CI job.").await?;
+    client.close().await?;
+    println!("{}", result.text);
+    Ok(())
+}
+```
+
+The Agent SDK surface also supports asynchronous message receipt, control
+operations, typed hooks, permission callbacks, MCP servers, and durable session
+stores. See the public `agent`, `extensions`, and `sessions` modules for the
+complete contracts.
 
 ### Create a Message
 
@@ -658,6 +692,13 @@ You can also pass any model ID string directly.
 
 | Feature | Status |
 |---------|--------|
+| Claude Code Agent SDK streaming protocol | Implemented |
+| Agent options, messages, results, and control requests | Implemented |
+| Hooks and tool-permission callbacks | Implemented |
+| In-process, stdio, HTTP, SSE, and proxy MCP servers | Implemented |
+| Skills, plugins, subagents, and sandbox configuration | Implemented |
+| Session query, mutation, import, fork, and resume APIs | Implemented |
+| Pluggable session stores and transcript mirroring | Implemented |
 | Messages (create) | Implemented |
 | Messages (streaming) | Implemented |
 | Extended thinking (enabled, disabled, adaptive) | Implemented |
@@ -725,7 +766,21 @@ Contributions are welcome. To get started:
 
 Please follow the existing code style, add doc comments to public items, and include tests for new functionality.
 
+## Release notes
+
+### 0.4.0
+
+- Added the Claude Code Agent SDK protocol with typed messages, control
+  requests, hooks, permissions, skills, plugins, subagents, and MCP servers.
+- Added filesystem-compatible and store-backed session listing, import,
+  mutation, fork, resume, transcript mirroring, and summary APIs.
+- Matched the official Python SDK's option serialization, message parsing,
+  cancellation, and session-store conformance behavior.
+- Hardened resume materialization, UUID validation, transcript parsing, and
+  cancellation-safe teardown.
+
 ---
+
 
 ## License
 

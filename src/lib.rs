@@ -145,12 +145,37 @@
 //! - [`models`] -- Model ID constants for all Claude model families.
 
 pub mod agent;
+mod agent_runtime;
 pub mod batch;
 pub mod client;
 pub mod error;
+pub mod extensions;
 pub mod models;
+pub mod sessions;
 pub mod streaming;
 pub mod transport;
 pub mod types;
 
+pub use error::ClaudeError;
+pub use extensions::{
+    AgentDefinition, AgentEffort, AgentMemory, BaseHookInput, CanUseTool,
+    CanUseToolShadowedWarning, ContextUsageCategory, ContextUsageResponse, HookCallback,
+    HookContext, HookEvent, HookHandler, HookInput, HookInputKind, HookJSONOutput, HookMatcher,
+    McpClaudeAiProxyServerConfig, McpHttpServerConfig, McpSdkServerConfig,
+    McpSdkServerConfigStatus, McpServerConfig, McpServerConnectionStatus, McpServerInfo,
+    McpServerStatus, McpServerStatusConfig, McpSseServerConfig, McpStatusResponse,
+    McpStdioServerConfig, McpToolAnnotations, McpToolInfo, ModelUsage, NotificationHookInput,
+    NotificationHookSpecificOutput, OutputFormat, PermissionBehavior, PermissionMode,
+    PermissionRequestHookInput, PermissionRequestHookSpecificOutput, PermissionResult,
+    PermissionRuleValue, PermissionUpdate, PermissionUpdateDestination, PermissionUpdateType,
+    PostToolUseFailureHookInput, PostToolUseFailureHookSpecificOutput, PostToolUseHookInput,
+    PostToolUseHookSpecificOutput, PreCompactHookInput, PreCompactTrigger, PreToolUseHookInput,
+    PreToolUseHookSpecificOutput, SandboxIgnoreViolations, SandboxNetworkConfig, SandboxSettings,
+    SdkBeta, SdkPluginConfig, SdkPluginKind, SessionStartHookSpecificOutput, SettingSource,
+    SkillSelection, StopHookInput, SubagentStartHookInput, SubagentStartHookSpecificOutput,
+    SubagentStopHookInput, SyncHookJSONOutput, SystemPrompt, TaskBudget, TaskUsage,
+    ThinkingConfig as AgentThinkingConfig, ThinkingDisplay, ToolPermissionCallback,
+    ToolPermissionContext, ToolsSpec, UserPromptSubmitHookInput,
+    UserPromptSubmitHookSpecificOutput,
+};
 pub use types::EffortLevel;
