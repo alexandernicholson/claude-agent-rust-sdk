@@ -7,8 +7,14 @@
 //! - [`parse_sse_line`] -- parse a single SSE data line into a [`StreamEvent`].
 //! - [`SseStream`] -- an async `Stream` of [`StreamEvent`] values built on top
 //!   of a `reqwest::Response` byte stream.
+//! - [`RawSseStream`] -- the same stream yielding untyped
+//!   [`serde_json::Value`] events, for event or content types this SDK does not
+//!   model yet.
 
 use futures::stream::Stream;
+use serde::de::DeserializeOwned;
+use std::collections::VecDeque;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -19,7 +25,17 @@ use crate::types::StreamEvent;
 ///
 /// Returns `None` if the line is empty, a comment, or doesn't start with
 /// `data: `. Returns `Some(Err(...))` if the JSON is malformed.
+#[must_use]
 pub fn parse_sse_line(line: &str) -> Option<Result<StreamEvent, ClaudeError>> {
+    parse_sse_data(line)
+}
+
+/// Parse an SSE `data:` line into any deserializable event type.
+///
+/// Same rules as [`parse_sse_line`]: empty lines, comments, `event:`/`id:`/
+/// `retry:` lines, and the `[DONE]` sentinel yield `None`.
+#[must_use]
+pub fn parse_sse_data<T: DeserializeOwned>(line: &str) -> Option<Result<T, ClaudeError>> {
     let line = line.trim();
 
     // Skip empty lines and comments
@@ -27,51 +43,54 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamEvent, ClaudeError>> {
         return None;
     }
 
-    // We only care about data lines
-    if let Some(data) = line.strip_prefix("data: ") {
-        // The [DONE] sentinel is not used by Claude, but handle it gracefully
-        if data == "[DONE]" {
-            return None;
-        }
-        Some(serde_json::from_str::<StreamEvent>(data).map_err(ClaudeError::SerializationError))
-    } else {
-        // event: lines, id: lines, retry: lines -- skip them
-        None
+    // We only care about data lines; event:, id:, and retry: lines are skipped
+    let data = line.strip_prefix("data:")?.trim_start();
+    // The [DONE] sentinel is not used by Claude, but handle it gracefully
+    if data == "[DONE]" {
+        return None;
     }
+    Some(serde_json::from_str::<T>(data).map_err(ClaudeError::SerializationError))
 }
 
-/// An async stream of [`StreamEvent`] values parsed from an SSE response.
+/// An async stream of events parsed from an SSE response.
 ///
-/// Constructed by [`ClaudeClient::create_message_stream`](crate::client::ClaudeClient::create_message_stream).
-pub struct SseStream {
-    /// Internal state: buffered lines from the response.
-    inner: Pin<Box<dyn Stream<Item = Result<StreamEvent, ClaudeError>> + Send>>,
+/// `SseStream` (the default type parameter) yields typed [`StreamEvent`]s and
+/// is returned by
+/// [`ClaudeClient::create_message_stream`](crate::client::ClaudeClient::create_message_stream).
+/// [`RawSseStream`] yields untyped JSON events.
+pub struct SseStream<T = StreamEvent> {
+    inner: Pin<Box<dyn Stream<Item = Result<T, ClaudeError>> + Send>>,
 }
 
-impl std::fmt::Debug for SseStream {
+/// An async stream of untyped [`serde_json::Value`] SSE events, returned by
+/// [`ClaudeClient::create_message_stream_raw`](crate::client::ClaudeClient::create_message_stream_raw).
+pub type RawSseStream = SseStream<serde_json::Value>;
+
+impl<T> std::fmt::Debug for SseStream<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SseStream").finish_non_exhaustive()
     }
 }
 
-impl SseStream {
-    /// Create a new `SseStream` from a `reqwest::Response`.
+impl<T: DeserializeOwned + Send + 'static> SseStream<T> {
+    /// Create a new stream from a `reqwest::Response`.
     ///
     /// The response must have been initiated with `stream: true`.
     pub(crate) fn from_response(response: reqwest::Response) -> Self {
-        let stream = async_stream(response);
         Self {
-            inner: Box::pin(stream),
+            inner: Box::pin(async_stream::<T>(response)),
         }
     }
+}
 
-    /// Create an `SseStream` from any async stream of [`StreamEvent`] values.
+impl<T> SseStream<T> {
+    /// Create a stream from any async stream of events.
     ///
     /// This is useful for custom [`Transport`](crate::transport::Transport)
     /// implementations that produce stream events from non-HTTP sources.
     pub fn from_stream<S>(stream: S) -> Self
     where
-        S: Stream<Item = Result<StreamEvent, ClaudeError>> + Send + 'static,
+        S: Stream<Item = Result<T, ClaudeError>> + Send + 'static,
     {
         Self {
             inner: Box::pin(stream),
@@ -79,14 +98,14 @@ impl SseStream {
     }
 }
 
-fn async_stream(
+fn async_stream<T: DeserializeOwned + Send + 'static>(
     response: reqwest::Response,
-) -> impl Stream<Item = Result<StreamEvent, ClaudeError>> + Send {
-    futures::stream::unfold(StreamState::new(response), |mut state| async move {
+) -> impl Stream<Item = Result<T, ClaudeError>> + Send {
+    futures::stream::unfold(StreamState::<T>::new(response), |mut state| async move {
         loop {
             // If we have buffered lines, process the next one
-            if let Some(line) = state.next_buffered_line() {
-                if let Some(result) = parse_sse_line(&line) {
+            if let Some(line) = state.lines.pop_front() {
+                if let Some(result) = parse_sse_data::<T>(&line) {
                     return Some((result, state));
                 }
                 // Line was empty/comment/event-type, skip
@@ -104,73 +123,49 @@ fn async_stream(
 }
 
 /// Internal state for the SSE stream unfold.
-struct StreamState {
+///
+/// Bytes are buffered until a full line is available, so a multi-byte UTF-8
+/// character split across network chunks still decodes correctly.
+struct StreamState<T> {
     response: reqwest::Response,
-    buffer: String,
-    lines: Vec<String>,
-    line_index: usize,
+    buffer: Vec<u8>,
+    lines: VecDeque<String>,
+    _item: PhantomData<fn() -> T>,
 }
 
-impl StreamState {
+impl<T> StreamState<T> {
     fn new(response: reqwest::Response) -> Self {
         Self {
             response,
-            buffer: String::new(),
-            lines: Vec::new(),
-            line_index: 0,
-        }
-    }
-
-    fn next_buffered_line(&mut self) -> Option<String> {
-        if self.line_index < self.lines.len() {
-            let line = self.lines[self.line_index].clone();
-            self.line_index += 1;
-            Some(line)
-        } else {
-            None
+            buffer: Vec::new(),
+            lines: VecDeque::new(),
+            _item: PhantomData,
         }
     }
 
     async fn read_chunk(&mut self) -> Result<bool, ClaudeError> {
-        match self.response.chunk().await? {
-            Some(bytes) => {
-                let text = String::from_utf8_lossy(&bytes);
-                self.buffer.push_str(&text);
-
-                // Split on double newlines (SSE event boundaries) or single newlines
-                let lines: Vec<String> = self.buffer.split('\n').map(ToString::to_string).collect();
-
-                // The last element might be an incomplete line
-                if self.buffer.ends_with('\n') {
-                    self.lines = lines;
-                    self.buffer.clear();
-                } else {
-                    // Keep the last incomplete line in the buffer
-                    let last = lines.last().cloned().unwrap_or_default();
-                    self.lines = lines[..lines.len().saturating_sub(1)].to_vec();
-                    self.buffer = last;
-                }
-
-                self.line_index = 0;
-                Ok(true)
+        if let Some(bytes) = self.response.chunk().await? {
+            self.buffer.extend_from_slice(&bytes);
+            while let Some(newline) = self.buffer.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = self.buffer.drain(..=newline).collect();
+                self.lines
+                    .push_back(String::from_utf8_lossy(&line).into_owned());
             }
-            None => {
-                // Process any remaining buffer
-                if self.buffer.is_empty() {
-                    Ok(false)
-                } else {
-                    let remaining = std::mem::take(&mut self.buffer);
-                    self.lines = remaining.split('\n').map(ToString::to_string).collect();
-                    self.line_index = 0;
-                    Ok(true)
-                }
-            }
+            Ok(true)
+        } else if self.buffer.is_empty() {
+            Ok(false)
+        } else {
+            // Process the final unterminated line
+            let remaining = std::mem::take(&mut self.buffer);
+            self.lines
+                .push_back(String::from_utf8_lossy(&remaining).into_owned());
+            Ok(true)
         }
     }
 }
 
-impl Stream for SseStream {
-    type Item = Result<StreamEvent, ClaudeError>;
+impl<T> Stream for SseStream<T> {
+    type Item = Result<T, ClaudeError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.inner.as_mut().poll_next(cx)
