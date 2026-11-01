@@ -35,7 +35,7 @@ use crate::types::{
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
-const API_VERSION: &str = "2023-06-01";
+const API_VERSION: &str = "2026-10-21";
 
 /// Authentication strategy.
 #[derive(Debug, Clone)]
@@ -62,6 +62,11 @@ pub struct ClaudeClient {
     auth: AuthMethod,
     /// Extra beta feature headers (e.g. `"interleaved-thinking-2025-05-14"`).
     beta_features: Vec<String>,
+    /// `anthropic-workspace-id` header sent with every request.
+    workspace_id: Option<HeaderValue>,
+    /// `anthropic-user-profile-id` header sent with message creation, token
+    /// counting, and batch creation.
+    user_profile_id: Option<HeaderValue>,
     /// Optional custom transport. When set, all operations delegate to it.
     transport: Option<Arc<dyn Transport>>,
 }
@@ -77,6 +82,8 @@ impl ClaudeClient {
             base_url: DEFAULT_BASE_URL.to_string(),
             auth: AuthMethod::ApiKey(api_key.to_string()),
             beta_features: Vec::new(),
+            workspace_id: None,
+            user_profile_id: None,
             transport: None,
         }
     }
@@ -89,6 +96,8 @@ impl ClaudeClient {
             base_url: DEFAULT_BASE_URL.to_string(),
             auth: AuthMethod::BearerToken(token.to_string()),
             beta_features: Vec::new(),
+            workspace_id: None,
+            user_profile_id: None,
             transport: None,
         }
     }
@@ -114,6 +123,8 @@ impl ClaudeClient {
             base_url: DEFAULT_BASE_URL.to_string(),
             auth: AuthMethod::ApiKey(String::new()),
             beta_features: Vec::new(),
+            workspace_id: None,
+            user_profile_id: None,
             transport: Some(Arc::new(transport)),
         }
     }
@@ -140,6 +151,40 @@ impl ClaudeClient {
     #[must_use]
     pub fn with_beta(mut self, feature: &str) -> Self {
         self.beta_features.push(feature.to_string());
+        self
+    }
+
+    /// Select the Workspace for every request (`anthropic-workspace-id`
+    /// header), e.g. `"wrkspc_011CZkZaBF1tNoB5wlCeusgy"`.
+    ///
+    /// Only needed for credentials that can act on more than one Workspace.
+    /// A Workspace-scoped credential may omit it; if sent, it must match.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `workspace_id` is not a valid HTTP header value.
+    #[must_use]
+    pub fn with_workspace_id(mut self, workspace_id: &str) -> Self {
+        self.workspace_id =
+            Some(HeaderValue::from_str(workspace_id).expect("invalid workspace ID characters"));
+        self
+    }
+
+    /// Attribute requests to a user profile (`anthropic-user-profile-id`
+    /// header) when acting on behalf of a party other than your
+    /// organization.
+    ///
+    /// Sent with message creation (including streaming), token counting,
+    /// and batch creation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `user_profile_id` is not a valid HTTP header value.
+    #[must_use]
+    pub fn with_user_profile_id(mut self, user_profile_id: &str) -> Self {
+        self.user_profile_id = Some(
+            HeaderValue::from_str(user_profile_id).expect("invalid user profile ID characters"),
+        );
         self
     }
 
@@ -177,7 +222,7 @@ impl ClaudeClient {
         }
 
         let url = format!("{}/v1/messages", self.base_url);
-        let headers = self.build_headers();
+        let headers = self.build_attributed_headers();
 
         debug!(url = %url, "sending create_message request");
 
@@ -252,7 +297,7 @@ impl ClaudeClient {
         }
 
         let url = format!("{}/v1/messages", self.base_url);
-        let headers = self.build_headers();
+        let headers = self.build_attributed_headers();
 
         // Force stream: true
         let mut req = request.clone();
@@ -309,7 +354,7 @@ impl ClaudeClient {
         }
 
         let url = format!("{}/v1/messages/count_tokens", self.base_url);
-        let headers = self.build_headers();
+        let headers = self.build_attributed_headers();
 
         debug!(url = %url, "sending count_tokens request");
 
@@ -379,6 +424,21 @@ impl ClaudeClient {
             }
         }
 
+        if let Some(workspace_id) = &self.workspace_id {
+            headers.insert("anthropic-workspace-id", workspace_id.clone());
+        }
+
+        headers
+    }
+
+    /// [`build_headers`](Self::build_headers) plus the
+    /// `anthropic-user-profile-id` header, for requests that create
+    /// messages, count tokens, or create batches.
+    pub(crate) fn build_attributed_headers(&self) -> HeaderMap {
+        let mut headers = self.build_headers();
+        if let Some(user_profile_id) = &self.user_profile_id {
+            headers.insert("anthropic-user-profile-id", user_profile_id.clone());
+        }
         headers
     }
 
@@ -440,7 +500,40 @@ mod tests {
         let headers = client.build_headers();
         assert_eq!(
             headers.get("anthropic-version").unwrap().to_str().unwrap(),
-            "2023-06-01"
+            "2026-10-21"
+        );
+    }
+
+    #[test]
+    fn workspace_header_on_every_request() {
+        let client = ClaudeClient::new("key").with_workspace_id("wrkspc_123");
+        for headers in [client.build_headers(), client.build_attributed_headers()] {
+            assert_eq!(
+                headers
+                    .get("anthropic-workspace-id")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "wrkspc_123"
+            );
+        }
+    }
+
+    #[test]
+    fn user_profile_header_only_on_attributed_requests() {
+        let client = ClaudeClient::new("key").with_user_profile_id("uprof_123");
+        assert!(client
+            .build_headers()
+            .get("anthropic-user-profile-id")
+            .is_none());
+        assert_eq!(
+            client
+                .build_attributed_headers()
+                .get("anthropic-user-profile-id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "uprof_123"
         );
     }
 

@@ -21,8 +21,8 @@ use serde_json::Value;
 
 use super::filesystem::{
     apply_sort_limit_offset, entries_to_session_messages, entries_to_subagent_messages,
-    parse_iso8601_ms, parse_session_info_from_lite, validate_uuid, LiteSessionFile, SessionMessage,
-    LITE_READ_BUF_SIZE,
+    parent_ids_from_agent_metadata, parse_iso8601_ms, parse_session_info_from_lite,
+    split_agent_metadata, validate_uuid, LiteSessionFile, SessionMessage, LITE_READ_BUF_SIZE,
 };
 use super::key::{canonicalize_path, project_key_for_directory, SessionKey, SessionListSubkeysKey};
 use super::store::{SDKSessionInfo, SessionStore, SessionStoreEntry};
@@ -513,7 +513,9 @@ pub async fn list_subagents_from_store(
 /// Subagents may live at `subagents/agent-<id>` or nested under
 /// `subagents/workflows/<runId>/agent-<id>`. Scans subkeys when the store
 /// implements [`list_subkeys`](SessionStore::list_subkeys); otherwise tries the
-/// direct path. Empty result if the session/subagent is not found.
+/// direct path. `parent_tool_use_id` / `parent_agent_id` are taken from the
+/// subagent's `agent_metadata` entry in the store (`None` if absent). Empty
+/// result if the session/subagent is not found.
 ///
 /// # Errors
 /// Adapter load failures.
@@ -553,17 +555,23 @@ pub async fn get_subagent_messages_from_store(
         _ => return Ok(Vec::new()),
     };
 
-    // Drop synthetic agent_metadata entries injected by the mirror hook — they
-    // describe the .meta.json sidecar, not transcript lines.
-    let transcript: Vec<SessionStoreEntry> = entries
-        .into_iter()
-        .filter(|e| e.get("type").and_then(Value::as_str) != Some("agent_metadata"))
-        .collect();
+    // The synthetic agent_metadata entry (the store's copy of the .meta.json
+    // sidecar) records which Agent tool_use spawned this subagent. Recover the
+    // parent ids from it -- last one wins, since the metadata is rewritten on
+    // resume -- then drop it: it is not a transcript line.
+    let (meta_entry, transcript) = split_agent_metadata(entries);
     if transcript.is_empty() {
         return Ok(Vec::new());
     }
+    let (parent_tool_use_id, parent_agent_id) = parent_ids_from_agent_metadata(meta_entry.as_ref());
     let filtered = filter_transcript_entries(&transcript);
-    Ok(entries_to_subagent_messages(&filtered, limit, offset))
+    Ok(entries_to_subagent_messages(
+        &filtered,
+        limit,
+        offset,
+        parent_tool_use_id.as_deref(),
+        parent_agent_id.as_deref(),
+    ))
 }
 
 #[cfg(test)]
@@ -730,6 +738,110 @@ mod tests {
             .unwrap();
         let uuids: Vec<&str> = msgs.iter().map(|m| m.uuid.as_str()).collect();
         assert_eq!(uuids, vec!["su1", "sa1"]);
+    }
+
+    #[tokio::test]
+    async fn subagent_parent_ids_come_from_last_metadata_entry() {
+        let dir = "/tmp/store-queries-parent-ids";
+        let store = store_with_session(dir).await;
+        let pk = project_key_for_directory(Some(std::path::Path::new(dir)));
+        store
+            .append(
+                &SessionKey::with_subpath(pk, SID, "subagents/agent-x").unwrap(),
+                vec![
+                    entry(json!({"type": "agent_metadata", "agentType": "gp", "toolUseId": "toolu_old"})),
+                    entry(json!({"type": "user", "uuid": "su1", "sessionId": SID, "message": {"content": "hi"}})),
+                    entry(json!({"type": "assistant", "uuid": "sa1", "parentUuid": "su1", "sessionId": SID, "message": {"content": "yo"}})),
+                    entry(json!({"type": "agent_metadata", "agentType": "gp", "toolUseId": "toolu_new", "parentAgentId": "a-parent"})),
+                ],
+            )
+            .await
+            .unwrap();
+        let msgs = get_subagent_messages_from_store(store.as_ref(), SID, "x", Some(dir), None, 0)
+            .await
+            .unwrap();
+        let uuids: Vec<&str> = msgs.iter().map(|m| m.uuid.as_str()).collect();
+        assert_eq!(uuids, vec!["su1", "sa1"]);
+        assert!(msgs
+            .iter()
+            .all(|m| m.parent_tool_use_id.as_deref() == Some("toolu_new")));
+        assert!(msgs
+            .iter()
+            .all(|m| m.parent_agent_id.as_deref() == Some("a-parent")));
+    }
+
+    #[tokio::test]
+    async fn subagent_parent_ids_ignore_non_string_metadata() {
+        let dir = "/tmp/store-queries-parent-ids-bad";
+        let store = store_with_session(dir).await;
+        let pk = project_key_for_directory(Some(std::path::Path::new(dir)));
+        store
+            .append(
+                &SessionKey::with_subpath(pk, SID, "subagents/agent-x").unwrap(),
+                vec![
+                    entry(json!({"type": "agent_metadata", "toolUseId": 7, "parentAgentId": null})),
+                    entry(json!({"type": "user", "uuid": "su1", "sessionId": SID, "message": {"content": "hi"}})),
+                ],
+            )
+            .await
+            .unwrap();
+        let msgs = get_subagent_messages_from_store(store.as_ref(), SID, "x", Some(dir), None, 0)
+            .await
+            .unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].parent_tool_use_id.is_none());
+        assert!(msgs[0].parent_agent_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn parallel_tool_calls_keep_every_call_and_result_from_store() {
+        let dir = "/tmp/store-queries-parallel";
+        let store = Arc::new(InMemorySessionStore::new());
+        let pk = project_key_for_directory(Some(std::path::Path::new(dir)));
+        let mut entries = vec![entry(
+            json!({"type": "user", "uuid": "prompt", "sessionId": SID, "message": {"content": "read them"}}),
+        )];
+        for i in 0..3 {
+            let parent = if i == 0 {
+                "prompt".to_string()
+            } else {
+                format!("call-{}", i - 1)
+            };
+            entries.push(entry(json!({
+                "type": "assistant", "uuid": format!("call-{i}"), "parentUuid": parent,
+                "sessionId": SID,
+                "message": {"id": "msg_parallel", "role": "assistant",
+                    "content": [{"type": "tool_use", "id": format!("toolu_{i}"), "name": "Read", "input": {}}]}
+            })));
+        }
+        for i in 0..3 {
+            entries.push(entry(json!({
+                "type": "user", "uuid": format!("result-{i}"), "parentUuid": format!("call-{i}"),
+                "sessionId": SID,
+                "message": {"content": [{"type": "tool_result", "tool_use_id": format!("toolu_{i}"), "content": "ok"}]}
+            })));
+        }
+        // The next response continues from the first result, so the walk back
+        // from it reaches only call-0.
+        entries.push(entry(
+            json!({"type": "assistant", "uuid": "answer", "parentUuid": "result-0", "sessionId": SID, "message": {"content": "done"}}),
+        ));
+        store
+            .append(&SessionKey::new(pk, SID), entries)
+            .await
+            .unwrap();
+
+        let msgs = get_session_messages_from_store(store.as_ref(), SID, Some(dir), None, 0)
+            .await
+            .unwrap();
+        let uuids: Vec<&str> = msgs.iter().map(|m| m.uuid.as_str()).collect();
+        assert_eq!(
+            uuids,
+            [
+                "prompt", "call-0", "call-1", "call-2", "result-1", "result-2", "result-0",
+                "answer"
+            ]
+        );
     }
 
     #[tokio::test]

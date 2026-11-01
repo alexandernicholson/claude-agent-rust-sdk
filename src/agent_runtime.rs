@@ -20,13 +20,14 @@ use crate::extensions::{
     SkillSelection, SystemPrompt, ToolPermissionContext,
 };
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 /// Task types whose completion runs a follow-up turn, and which therefore may
 /// still need the control channel after the turn's result frame. Mirrors
@@ -41,13 +42,24 @@ const MESSAGE_BUFFER: usize = 100;
 
 /// One item delivered to a consumer of the regular-message stream.
 enum StreamItem {
-    /// A regular (non-control) Agent SDK frame, as raw JSON. `run_ended` is
-    /// `true` only for a `result` frame that ended the run (no delegated tasks
-    /// in flight); it lets the aggregate `query` tell an intermediate turn
-    /// result apart from the run-ending one without a racy shared latch.
-    Message { frame: Value, run_ended: bool },
+    /// A regular (non-control) Agent SDK frame, as raw JSON.
+    Message { frame: Value },
+    /// The run is over: stdin no longer needs to stay open for control
+    /// requests. Follows the frame that ended the run.
+    RunEnded,
     /// The reader observed a fatal error; consumers fail with it.
     Error(ClaudeError),
+}
+
+/// One event from [`Runtime::receive_event`].
+// Transient value moved straight to the caller; boxing every message would
+// allocate on the hot path to shrink a short-lived enum.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum RuntimeEvent {
+    /// A regular Agent SDK message.
+    Message(AgentMessage),
+    /// The run ended (see [`RunTracker`]).
+    RunEnded,
 }
 
 /// Shared control-protocol state touched by the reader task and control senders.
@@ -102,12 +114,9 @@ pub(crate) struct Runtime<T: AgentTransport> {
     receiver: Mutex<mpsc::Receiver<StreamItem>>,
     reader: Mutex<Option<JoinHandle<()>>>,
     request_counter: AtomicU64,
-    /// Fires when a run-ending result arrives (result with no in-flight tasks)
-    /// or the reader's cleanup runs. Lets the stdin-closing waiter wake.
-    run_ended: Arc<Notify>,
-    run_ended_flag: Arc<std::sync::atomic::AtomicBool>,
-    /// Whether SDK MCP servers or hooks require holding stdin open until a
-    /// run-ending result (mirrors Python `wait_for_result_and_end_input`).
+    /// Whether SDK MCP servers, hooks, or a permission callback require
+    /// holding stdin open until the run ends (Python
+    /// `wait_for_result_and_end_input`).
     defer_end_input: bool,
     initialize_timeout: Duration,
     closed: Arc<std::sync::atomic::AtomicBool>,
@@ -125,7 +134,6 @@ impl<T: AgentTransport> fmt::Debug for Runtime<T> {
             .debug_struct("Runtime")
             .field("defer_end_input", &self.defer_end_input)
             .field("closed", &self.closed.load(Ordering::SeqCst))
-            .field("run_ended", &self.run_ended_flag.load(Ordering::SeqCst))
             .finish_non_exhaustive()
     }
 }
@@ -162,8 +170,6 @@ impl<T: AgentTransport> Runtime<T> {
 
         let control = Arc::new(ControlState::new());
         let (sender, receiver) = mpsc::channel::<StreamItem>(MESSAGE_BUFFER);
-        let run_ended = Arc::new(Notify::new());
-        let run_ended_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Build the SessionStore mirror batcher when a store is configured. Its
@@ -179,17 +185,23 @@ impl<T: AgentTransport> Runtime<T> {
             control: Arc::clone(&control),
         };
 
+        // Whether control requests (SDK MCP servers, hooks, a permission
+        // callback) may still need stdin until the run ends.
+        let defer_end_input = !ctx.mcp_servers.is_empty()
+            || options.hooks.as_ref().is_some_and(|h| !h.is_empty())
+            || ctx.can_use_tool.is_some();
+        let run_state = Arc::new(RunState::new(RunTracker::new(
+            defer_end_input,
+            run_end_ceiling_ms(&options.env),
+        )));
+
         let reader = tokio::spawn(read_messages(
             ctx.clone(),
             sender,
-            Arc::clone(&run_ended),
-            Arc::clone(&run_ended_flag),
+            run_state,
             Arc::clone(&closed),
             batcher.clone(),
         ));
-
-        let defer_end_input =
-            !ctx.mcp_servers.is_empty() || options.hooks.as_ref().is_some_and(|h| !h.is_empty());
 
         let runtime = Self {
             transport,
@@ -197,8 +209,6 @@ impl<T: AgentTransport> Runtime<T> {
             receiver: Mutex::new(receiver),
             reader: Mutex::new(Some(reader)),
             request_counter: AtomicU64::new(0),
-            run_ended,
-            run_ended_flag,
             defer_end_input,
             initialize_timeout: options.initialize_timeout,
             closed,
@@ -254,28 +264,34 @@ impl<T: AgentTransport> Runtime<T> {
 
     /// Receive the next regular Agent SDK message, or `None` at end of stream.
     ///
-    /// Unknown top-level frames are skipped; malformed known frames surface as
-    /// [`ClaudeError::MessageParse`].
+    /// Unknown top-level frames and run-end markers are skipped; malformed
+    /// known frames surface as [`ClaudeError::MessageParse`].
     pub(crate) async fn receive(&self) -> Result<Option<AgentMessage>, ClaudeError> {
-        Ok(self.receive_annotated().await?.map(|(message, _)| message))
+        loop {
+            match self.receive_event().await? {
+                None => return Ok(None),
+                Some(RuntimeEvent::Message(message)) => return Ok(Some(message)),
+                Some(RuntimeEvent::RunEnded) => {}
+            }
+        }
     }
 
-    /// Like [`receive`](Self::receive) but also reports whether a `result`
-    /// message ended the run (no delegated tasks in flight). The flag is only
-    /// meaningful for [`AgentMessage::Result`]; it is `false` for every other
-    /// message. Used by the aggregate `query` to drain the correct run
-    /// boundary without a racy shared latch.
-    pub(crate) async fn receive_annotated(
-        &self,
-    ) -> Result<Option<(AgentMessage, bool)>, ClaudeError> {
+    /// Like [`receive`](Self::receive) but also reports run-end markers: the
+    /// point where the run is over and stdin no longer needs to stay open for
+    /// control requests. The marker follows the frame that ended the run (the
+    /// `result` itself, or the `idle` state frame that followed it, which is
+    /// not surfaced when it is `sdk_host_only`). Used by the aggregate `query`
+    /// to drain the correct run boundary without a racy shared latch.
+    pub(crate) async fn receive_event(&self) -> Result<Option<RuntimeEvent>, ClaudeError> {
         let mut receiver = self.receiver.lock().await;
         loop {
             match receiver.recv().await {
                 None => return Ok(None),
                 Some(StreamItem::Error(error)) => return Err(error),
-                Some(StreamItem::Message { frame, run_ended }) => {
+                Some(StreamItem::RunEnded) => return Ok(Some(RuntimeEvent::RunEnded)),
+                Some(StreamItem::Message { frame }) => {
                     if let Some(message) = AgentMessage::from_value(frame)? {
-                        return Ok(Some((message, run_ended)));
+                        return Ok(Some(RuntimeEvent::Message(message)));
                     }
                 }
             }
@@ -369,9 +385,6 @@ impl<T: AgentTransport> Runtime<T> {
         if let Some(handle) = self.reader.lock().await.take() {
             handle.abort();
         }
-        // Wake any stdin waiter so it doesn't stall.
-        self.run_ended_flag.store(true, Ordering::SeqCst);
-        self.run_ended.notify_waiters();
         // Final mirror flush before teardown: aborting the reader above may
         // skip its own finally-flush, so flush here too (idempotent).
         if let Some(batcher) = &self.batcher {
@@ -436,10 +449,7 @@ fn build_connect_batcher(
                 });
                 // Non-blocking: drop on a full buffer rather than stalling the
                 // batcher.
-                let _ = error_sender.try_send(StreamItem::Message {
-                    frame,
-                    run_ended: false,
-                });
+                let _ = error_sender.try_send(StreamItem::Message { frame });
             })
         });
         Arc::new(crate::sessions::build_mirror_batcher(
@@ -470,18 +480,22 @@ fn enqueue_mirror_frame(
     Ok(())
 }
 
-/// The detached reader loop: read frames, route control traffic, track the task
-/// ledger and error attribution, and forward regular frames to the stream.
+/// The detached reader loop: read frames, route control traffic, track the run
+/// boundary and error attribution, and forward regular frames to the stream.
 async fn read_messages<T: AgentTransport>(
     ctx: ControlContext<T>,
     sender: mpsc::Sender<StreamItem>,
-    run_ended: Arc<Notify>,
-    run_ended_flag: Arc<std::sync::atomic::AtomicBool>,
+    run_state: Arc<RunState>,
     closed: Arc<std::sync::atomic::AtomicBool>,
     batcher: Option<Arc<crate::sessions::TranscriptMirrorBatcher>>,
 ) {
-    let mut inflight_tasks: HashSet<String> = HashSet::new();
-    let mut last_error_result_text: Option<String> = None;
+    let mut last_error_result: Option<Value> = None;
+    let timer = run_state.has_ceiling_timer().then(|| {
+        AbortOnDrop(tokio::spawn(run_end_timer(
+            Arc::clone(&run_state),
+            sender.clone(),
+        )))
+    });
 
     loop {
         if closed.load(Ordering::SeqCst) {
@@ -493,12 +507,10 @@ async fn read_messages<T: AgentTransport>(
             Err(error) => {
                 fail_read_error(
                     error,
-                    last_error_result_text.as_deref(),
+                    last_error_result.as_ref(),
                     &ctx.control,
                     batcher.as_ref(),
                     &sender,
-                    &run_ended,
-                    &run_ended_flag,
                 )
                 .await;
                 return;
@@ -531,12 +543,10 @@ async fn read_messages<T: AgentTransport>(
                 if let Err(error) = enqueue_mirror_frame(&frame, batcher.as_ref()) {
                     fail_read_error(
                         error,
-                        last_error_result_text.as_deref(),
+                        last_error_result.as_ref(),
                         &ctx.control,
                         batcher.as_ref(),
                         &sender,
-                        &run_ended,
-                        &run_ended_flag,
                     )
                     .await;
                     return;
@@ -546,41 +556,42 @@ async fn read_messages<T: AgentTransport>(
             _ => {}
         }
 
+        let mut run_ended = false;
+        let mut host_only = false;
         if msg_type == "system" {
-            track_task_lifecycle(&frame, &mut inflight_tasks);
+            run_ended = run_state.update(|tracker| tracker.on_system_frame(&frame));
+            // State frames the CLI sent only because the transport asked for
+            // them (`CLAUDE_CODE_SDK_READS_SESSION_STATE`); the caller did not
+            // opt in, so they drive the run boundary but are not surfaced.
+            host_only = is_session_state_frame(&frame, msg_type)
+                && frame.get("sdk_host_only").and_then(Value::as_bool) == Some(true);
+        } else if is_main_thread_turn_frame(&frame, msg_type) {
+            run_state.update(|tracker| {
+                tracker.on_turn_activity();
+                false
+            });
         }
 
-        let frame_run_ended = update_run_state(
-            &frame,
-            msg_type,
-            &inflight_tasks,
-            batcher.as_ref(),
-            &run_ended,
-            &run_ended_flag,
-            &mut last_error_result_text,
-        )
-        .await;
+        track_error_result(&frame, msg_type, batcher.as_ref(), &mut last_error_result).await;
+        if msg_type == "result" {
+            run_ended = run_state.update(RunTracker::on_result);
+        }
 
-        if sender
-            .send(StreamItem::Message {
-                frame,
-                run_ended: frame_run_ended,
-            })
-            .await
-            .is_err()
-        {
+        if !host_only && sender.send(StreamItem::Message { frame }).await.is_err() {
             // Consumer dropped the receiver: nothing left to deliver.
+            break;
+        }
+        if run_ended && sender.send(StreamItem::RunEnded).await.is_err() {
             break;
         }
     }
 
-    // Clean end of stream: final mirror flush, wake stdin waiter, then drop the
-    // sender (channel close signals end to consumers as `None`).
+    // Clean end of stream: final mirror flush, then drop the timer and sender
+    // (channel close signals end to consumers as `None`).
     if let Some(batcher) = &batcher {
         batcher.close().await;
     }
-    run_ended_flag.store(true, Ordering::SeqCst);
-    run_ended.notify_waiters();
+    drop(timer);
     drop(sender);
 }
 
@@ -624,27 +635,22 @@ fn parse_mirror_frame(
 }
 
 /// Tear down the reader on a transport read error: fan the error out to pending
-/// waiters, flush the mirror batcher, deliver the error to the stream, and wake
-/// the stdin waiter.
+/// waiters, flush the mirror batcher, and deliver the error to the stream.
 ///
 /// The CLI emits an `is_error` result then exits non-zero on purpose, so a bare
-/// process error is replaced with the structured result text when one was seen
-/// this turn. Mirrors the TS/Python SDK.
+/// process error is replaced with a [`ClaudeError::ResultError`] carrying that
+/// result when one was seen this turn. Mirrors the TS/Python SDK.
 async fn fail_read_error(
     error: ClaudeError,
-    last_error_result_text: Option<&str>,
+    last_error_result: Option<&Value>,
     control: &ControlState,
     batcher: Option<&Arc<crate::sessions::TranscriptMirrorBatcher>>,
     sender: &mpsc::Sender<StreamItem>,
-    run_ended: &Arc<Notify>,
-    run_ended_flag: &Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let pending_error = match (&error, last_error_result_text) {
-        (ClaudeError::Process { exit_code, .. }, Some(text)) => ClaudeError::Process {
-            message: format!("Claude Code returned an error result: {text}"),
-            exit_code: *exit_code,
-            stderr: None,
-        },
+    let pending_error = match (&error, last_error_result) {
+        (ClaudeError::Process { exit_code, .. }, Some(result)) => {
+            ClaudeError::result_error(result, *exit_code)
+        }
         _ => error,
     };
     fail_pending(control, &pending_error).await;
@@ -654,69 +660,41 @@ async fn fail_read_error(
         batcher.close().await;
     }
     let _ = sender.send(StreamItem::Error(pending_error)).await;
-    run_ended_flag.store(true, Ordering::SeqCst);
-    run_ended.notify_waiters();
 }
 
-/// Update run-boundary and error-attribution state for a non-control frame.
-///
-/// Returns whether this frame ends the run (only ever true for a `result`
-/// frame emitted with no delegated task in flight). Also flushes the mirror
-/// batcher before a run-ending result and tracks the last error-result text so
-/// a following process error can be replaced with the structured result text.
-async fn update_run_state(
+/// Flush the mirror batcher before a `result` is yielded and track the last
+/// error result, so a following process error can be replaced with a
+/// [`ClaudeError::ResultError`] carrying that result.
+async fn track_error_result(
     frame: &Value,
     msg_type: &str,
-    inflight_tasks: &HashSet<String>,
     batcher: Option<&Arc<crate::sessions::TranscriptMirrorBatcher>>,
-    run_ended: &Arc<Notify>,
-    run_ended_flag: &Arc<std::sync::atomic::AtomicBool>,
-    last_error_result_text: &mut Option<String>,
-) -> bool {
-    let mut frame_run_ended = false;
+    last_error_result: &mut Option<Value>,
+) {
     if msg_type == "result" {
         // Flush pending mirror entries before yielding the result so a
         // consumer observing the result sees an up-to-date SessionStore.
         if let Some(batcher) = batcher {
             batcher.flush().await;
         }
-        // A result ends the run only when no delegated task is in flight.
-        frame_run_ended = inflight_tasks.is_empty();
-        if frame_run_ended {
-            run_ended_flag.store(true, Ordering::SeqCst);
-            run_ended.notify_waiters();
-        }
-        if frame.get("is_error").and_then(Value::as_bool) == Some(true) {
-            let errors: Vec<String> = frame
-                .get("errors")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|v| v.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default();
-            *last_error_result_text = Some(if errors.is_empty() {
-                frame
-                    .get("subtype")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown error")
-                    .to_owned()
-            } else {
-                errors.join("; ")
-            });
-        } else {
-            *last_error_result_text = None;
-        }
-    } else if !(msg_type == "system"
-        && frame.get("subtype").and_then(Value::as_str) == Some("session_state_changed"))
-    {
+        *last_error_result =
+            (frame.get("is_error").and_then(Value::as_bool) == Some(true)).then(|| frame.clone());
+    } else if !is_session_state_frame(frame, msg_type) {
         // Any non-marker frame means the conversation moved on; a later
         // process error is a fresh crash, not the expected error-result exit.
-        *last_error_result_text = None;
+        *last_error_result = None;
     }
-    frame_run_ended
+}
+
+fn is_session_state_frame(frame: &Value, msg_type: &str) -> bool {
+    msg_type == "system"
+        && frame.get("subtype").and_then(Value::as_str) == Some("session_state_changed")
+}
+
+/// Whether a frame is a main-thread turn frame (not subagent output).
+fn is_main_thread_turn_frame(frame: &Value, msg_type: &str) -> bool {
+    matches!(msg_type, "assistant" | "stream_event")
+        && frame.get("parent_tool_use_id").is_none_or(Value::is_null)
 }
 
 /// Signal every pending outbound control waiter with a fatal error.
@@ -940,6 +918,250 @@ fn track_task_lifecycle(frame: &Value, inflight: &mut HashSet<String>) {
     }
 }
 
+/// Environment variable bounding the wait for the CLI's `idle`; the CLI reads
+/// the same variable for its own background-wait ceiling once stdin closes.
+const RUN_END_CEILING_ENV: &str = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS";
+
+/// The CLI's default background-wait ceiling (10 minutes).
+const DEFAULT_RUN_END_CEILING_MS: u64 = 600_000;
+
+/// Longest ceiling honored (~24.8 days), as in the Python and TypeScript SDKs.
+const MAX_RUN_END_CEILING_MS: u64 = 2_147_483_647;
+
+/// Read `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` as the CLI will see it:
+/// `options_env` overrides the inherited environment. `0` means no limit;
+/// anything that is not a plain non-negative integer falls back to the CLI's
+/// default of 10 minutes.
+fn run_end_ceiling_ms(options_env: &BTreeMap<String, String>) -> u64 {
+    options_env
+        .get(RUN_END_CEILING_ENV)
+        .cloned()
+        .or_else(|| std::env::var(RUN_END_CEILING_ENV).ok())
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or(DEFAULT_RUN_END_CEILING_MS)
+}
+
+/// Run-boundary state machine for runs that serve control requests (hooks,
+/// `can_use_tool`, SDK MCP servers), mirroring Python `Query` (#1088, #1190).
+///
+/// A `result` frame ends one turn, not necessarily the run: a background agent
+/// that finished just before it still wakes the session for a follow-up turn
+/// whose control requests need stdin. A CLI that reports
+/// `session_state_changed` stays `running` while such a turn is owed and
+/// reports `idle` once it is not, so the run ends at the `idle` that follows a
+/// result (or at a result that follows `idle`). A CLI that sends no state
+/// falls back to ending the run at the first result with no tracked
+/// background agent in flight. The wait for `idle` is bounded by a ceiling
+/// that counts only the gap between turns.
+///
+/// Every transition method returns `true` when the run just ended.
+// The four flags are independent run-boundary facts, not a state machine.
+#[allow(clippy::struct_excessive_bools)]
+struct RunTracker {
+    /// Whether control requests may still need stdin (hooks, SDK MCP servers,
+    /// or a permission callback).
+    needs_stdin: bool,
+    /// Bound on the wait for `idle`; `None` waits however long it takes.
+    ceiling: Option<Duration>,
+    /// Started-but-unfinished delegated tasks (#1088).
+    inflight_tasks: HashSet<String>,
+    /// Latest `session_state_changed` state; `None` while the CLI sends none.
+    session_state: Option<String>,
+    result_received: bool,
+    /// A main-thread turn is under way, so the ceiling is not armed.
+    turn_in_progress: bool,
+    run_ended: bool,
+    deadline: Option<Instant>,
+}
+
+impl RunTracker {
+    fn new(needs_stdin: bool, ceiling_ms: u64) -> Self {
+        Self {
+            needs_stdin,
+            ceiling: (ceiling_ms > 0)
+                .then(|| Duration::from_millis(ceiling_ms.min(MAX_RUN_END_CEILING_MS))),
+            inflight_tasks: HashSet::new(),
+            session_state: None,
+            result_received: false,
+            turn_in_progress: false,
+            run_ended: false,
+            deadline: None,
+        }
+    }
+
+    /// Track a `system` frame: task lifecycle and `session_state_changed`.
+    fn on_system_frame(&mut self, frame: &Value) -> bool {
+        let had_tasks = !self.inflight_tasks.is_empty();
+        track_task_lifecycle(frame, &mut self.inflight_tasks);
+        if had_tasks && self.inflight_tasks.is_empty() {
+            // The ceiling left the last tracked agent alone; the wait between
+            // turns starts over now that it settled.
+            self.rearm_between_turns();
+        }
+        if frame.get("subtype").and_then(Value::as_str) == Some("session_state_changed") {
+            return self.on_session_state(frame.get("state").and_then(Value::as_str));
+        }
+        false
+    }
+
+    fn on_session_state(&mut self, state: Option<&str>) -> bool {
+        self.session_state = state.map(str::to_owned);
+        if state == Some("idle") {
+            return self.result_received && self.maybe_end_run();
+        }
+        // Work the CLI took up after the run ended reopens the run until the
+        // next `idle`.
+        self.run_ended = false;
+        if state == Some("requires_action") {
+            // The host is answering a request; stdin must outlast it.
+            self.deadline = None;
+        } else {
+            self.rearm_between_turns();
+        }
+        false
+    }
+
+    fn on_result(&mut self) -> bool {
+        self.result_received = true;
+        self.turn_in_progress = false;
+        // Every result is a fresh run-boundary decision.
+        self.run_ended = false;
+        let state = self.session_state.as_deref();
+        if matches!(state, None | Some("idle")) || !self.needs_stdin {
+            return self.maybe_end_run();
+        }
+        if state != Some("requires_action") {
+            // While the SDK is still answering a request the ceiling waits for
+            // the `running` that follows.
+            self.arm_ceiling();
+        }
+        false
+    }
+
+    /// A main-thread `assistant`/`stream_event` frame: a turn is under way, so
+    /// the ceiling stops and an ended run reopens.
+    fn on_turn_activity(&mut self) {
+        self.turn_in_progress = true;
+        self.run_ended = false;
+        self.deadline = None;
+    }
+
+    /// The ceiling timer for `deadline` fired.
+    fn on_ceiling(&mut self, deadline: Instant) -> bool {
+        if self.deadline != Some(deadline) {
+            return false;
+        }
+        self.deadline = None;
+        // A tracked background agent may still need stdin for its hook,
+        // permission and SDK MCP requests, so it is not cut off; the ceiling
+        // starts over once it settles.
+        self.inflight_tasks.is_empty() && self.end_run()
+    }
+
+    fn maybe_end_run(&mut self) -> bool {
+        // Tracked background agents may still need stdin; a later result or
+        // `idle` ends the run once they settle.
+        self.inflight_tasks.is_empty() && self.end_run()
+    }
+
+    fn end_run(&mut self) -> bool {
+        self.deadline = None;
+        !std::mem::replace(&mut self.run_ended, true)
+    }
+
+    fn arm_ceiling(&mut self) {
+        self.deadline = None;
+        let Some(ceiling) = self.ceiling else {
+            return;
+        };
+        if self.run_ended || self.turn_in_progress || !self.needs_stdin {
+            return;
+        }
+        self.deadline = Some(Instant::now() + ceiling);
+    }
+
+    /// Restart the ceiling when the run is between turns, past a result, with
+    /// the CLI still reporting work.
+    fn rearm_between_turns(&mut self) {
+        if self.result_received
+            && !matches!(
+                self.session_state.as_deref(),
+                None | Some("idle" | "requires_action")
+            )
+        {
+            self.arm_ceiling();
+        }
+    }
+}
+
+/// [`RunTracker`] shared between the reader and the ceiling timer task.
+struct RunState {
+    tracker: parking_lot::Mutex<RunTracker>,
+    /// Signalled when the tracker's deadline changed.
+    deadline_changed: tokio::sync::Notify,
+}
+
+impl RunState {
+    fn new(tracker: RunTracker) -> Self {
+        Self {
+            tracker: parking_lot::Mutex::new(tracker),
+            deadline_changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Apply `transition`, waking the timer task if the deadline moved.
+    /// Returns whether the run just ended.
+    fn update(&self, transition: impl FnOnce(&mut RunTracker) -> bool) -> bool {
+        let mut tracker = self.tracker.lock();
+        let before = tracker.deadline;
+        let ended = transition(&mut tracker);
+        if tracker.deadline != before {
+            self.deadline_changed.notify_one();
+        }
+        ended
+    }
+
+    fn has_ceiling_timer(&self) -> bool {
+        let tracker = self.tracker.lock();
+        tracker.needs_stdin && tracker.ceiling.is_some()
+    }
+}
+
+/// Aborts the wrapped task when dropped, so the ceiling timer dies with the
+/// reader even when the reader itself is aborted.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Ends the run when no `idle` arrives within the ceiling after a result.
+async fn run_end_timer(state: Arc<RunState>, sender: mpsc::Sender<StreamItem>) {
+    loop {
+        let notified = state.deadline_changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let deadline = state.tracker.lock().deadline;
+        let Some(deadline) = deadline else {
+            notified.await;
+            continue;
+        };
+        tokio::select! {
+            () = tokio::time::sleep_until(deadline) => {
+                if state.update(|tracker| tracker.on_ceiling(deadline))
+                    && sender.send(StreamItem::RunEnded).await.is_err()
+                {
+                    return;
+                }
+            }
+            () = &mut notified => {}
+        }
+    }
+}
+
 /// Build the initialize hooks payload and register callbacks by generated id.
 ///
 /// Returns the wire `hooks` object (or `Value::Null` when empty) and the
@@ -1017,6 +1239,18 @@ fn build_initialize_request(
         request.insert("excludeDynamicSections".into(), Value::Bool(*exclude));
     }
 
+    if let Some(snapshot) = options
+        .system_prompt
+        .as_ref()
+        .and_then(SystemPrompt::snapshot)
+    {
+        request.insert("systemPromptSnapshot".into(), Value::Bool(snapshot));
+    }
+
+    if options.forward_subagent_text {
+        request.insert("forwardSubagentText".into(), Value::Bool(true));
+    }
+
     // 'all' and omitted are equivalent at the wire level; only send an explicit
     // list.
     if let Some(SkillSelection::List(names)) = options.skills.as_ref() {
@@ -1044,6 +1278,7 @@ fn clone_error(error: &ClaudeError) -> ClaudeError {
             exit_code: *exit_code,
             stderr: stderr.clone(),
         },
+        ClaudeError::ResultError(details) => ClaudeError::ResultError(details.clone()),
         ClaudeError::ControlTimeout { subtype } => ClaudeError::ControlTimeout {
             subtype: subtype.clone(),
         },
@@ -1132,5 +1367,97 @@ mod tests {
             parse_mirror_frame(&frame),
             Err(ClaudeError::MessageParse { .. })
         ));
+    }
+
+    fn state_frame(state: &str) -> Value {
+        json!({"type": "system", "subtype": "session_state_changed", "state": state})
+    }
+
+    fn task_frame(subtype: &str, task_id: &str) -> Value {
+        json!({"type": "system", "subtype": subtype, "task_id": task_id,
+               "task_type": "local_agent"})
+    }
+
+    #[test]
+    fn run_ends_at_idle_after_a_result() {
+        let mut tracker = RunTracker::new(true, 0);
+        assert!(!tracker.on_system_frame(&state_frame("running")));
+        // Idle before any result never ends the run.
+        assert!(!tracker.on_system_frame(&state_frame("idle")));
+        assert!(!tracker.on_system_frame(&state_frame("running")));
+        assert!(!tracker.on_result());
+        assert!(tracker.on_system_frame(&state_frame("idle")));
+    }
+
+    #[test]
+    fn run_ends_at_result_when_idle_came_first_or_state_is_absent() {
+        let mut tracker = RunTracker::new(true, 0);
+        tracker.on_system_frame(&state_frame("idle"));
+        assert!(tracker.on_result());
+
+        let mut stateless = RunTracker::new(true, 0);
+        assert!(stateless.on_result());
+        // A later turn's result is a fresh decision.
+        assert!(stateless.on_result());
+    }
+
+    #[test]
+    fn tracked_background_agent_holds_the_run_open() {
+        let mut tracker = RunTracker::new(true, 0);
+        tracker.on_system_frame(&task_frame("task_started", "t1"));
+        assert!(!tracker.on_result());
+        assert!(!tracker.on_system_frame(&state_frame("idle")));
+        tracker.on_system_frame(&task_frame("task_notification", "t1"));
+        assert!(tracker.on_result());
+    }
+
+    #[test]
+    fn ceiling_arms_between_turns_and_stops_for_turn_activity() {
+        let mut tracker = RunTracker::new(true, 1_000);
+        tracker.on_system_frame(&state_frame("running"));
+        assert!(!tracker.on_result());
+        let deadline = tracker.deadline.expect("ceiling armed after a result");
+        // A main-thread turn stops the ceiling.
+        tracker.on_turn_activity();
+        assert!(tracker.deadline.is_none());
+        assert!(!tracker.on_ceiling(deadline));
+        // The next result re-arms it, and firing ends the run once.
+        assert!(!tracker.on_result());
+        let deadline = tracker.deadline.expect("re-armed");
+        assert!(tracker.on_ceiling(deadline));
+        assert!(!tracker.on_ceiling(deadline));
+    }
+
+    #[test]
+    fn ceiling_leaves_tracked_agent_alone_and_restarts_when_it_settles() {
+        let mut tracker = RunTracker::new(true, 1_000);
+        tracker.on_system_frame(&task_frame("task_started", "t1"));
+        tracker.on_system_frame(&state_frame("running"));
+        tracker.on_result();
+        let deadline = tracker.deadline.unwrap();
+        assert!(!tracker.on_ceiling(deadline));
+        assert!(tracker.deadline.is_none());
+        tracker.on_system_frame(&task_frame("task_notification", "t1"));
+        assert!(tracker.deadline.is_some());
+    }
+
+    #[test]
+    fn requires_action_pauses_the_ceiling() {
+        let mut tracker = RunTracker::new(true, 1_000);
+        tracker.on_system_frame(&state_frame("requires_action"));
+        tracker.on_result();
+        assert!(tracker.deadline.is_none());
+        tracker.on_system_frame(&state_frame("running"));
+        assert!(tracker.deadline.is_some());
+    }
+
+    #[test]
+    fn run_end_ceiling_reads_options_env_with_cli_default() {
+        let env =
+            |value: &str| BTreeMap::from([(RUN_END_CEILING_ENV.to_owned(), value.to_owned())]);
+        assert_eq!(run_end_ceiling_ms(&env("1500")), 1_500);
+        assert_eq!(run_end_ceiling_ms(&env("0")), 0);
+        assert_eq!(run_end_ceiling_ms(&env("-5")), DEFAULT_RUN_END_CEILING_MS);
+        assert_eq!(run_end_ceiling_ms(&env("soon")), DEFAULT_RUN_END_CEILING_MS);
     }
 }

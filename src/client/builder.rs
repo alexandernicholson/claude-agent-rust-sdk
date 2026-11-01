@@ -16,7 +16,6 @@
 //!     .max_tokens(1024)
 //!     .system("You are a helpful assistant.")
 //!     .user("Hello!")
-//!     .temperature(0.7)
 //!     .send()
 //!     .await?;
 //! ```
@@ -25,9 +24,9 @@ use crate::client::ClaudeClient;
 use crate::error::ClaudeError;
 use crate::streaming::SseStream;
 use crate::types::{
-    CacheControl, ContentBlock, CreateMessageRequest, CreateMessageResponse, EffortLevel, Message,
-    MessageContent, Metadata, OutputConfig, OutputFormat, Role, ServerTool, SystemPrompt,
-    ThinkingConfig, Tool, ToolChoice, ToolDefinition,
+    CacheControl, ContentBlock, CreateMessageRequest, CreateMessageResponse, Diagnostics,
+    EffortLevel, Message, MessageContent, Metadata, OutputConfig, OutputFormat, Role, ServerTool,
+    SystemPrompt, ThinkingConfig, Tool, ToolChoice, ToolDefinition, Toolset,
 };
 
 /// A fluent builder for constructing and sending a message request.
@@ -39,7 +38,6 @@ use crate::types::{
 ///     .max_tokens(1024)
 ///     .system("You are a helpful assistant.")
 ///     .user("Hello!")
-///     .temperature(0.7)
 ///     .send()
 ///     .await?;
 /// ```
@@ -50,9 +48,6 @@ pub struct MessageBuilder<'a> {
     max_tokens: Option<u32>,
     messages: Vec<Message>,
     system: Option<SystemPrompt>,
-    temperature: Option<f64>,
-    top_p: Option<f64>,
-    top_k: Option<u32>,
     stop_sequences: Option<Vec<String>>,
     stream: Option<bool>,
     tools: Option<Vec<ToolDefinition>>,
@@ -62,6 +57,8 @@ pub struct MessageBuilder<'a> {
     output_config: Option<OutputConfig>,
     thinking: Option<ThinkingConfig>,
     service_tier: Option<String>,
+    speed: Option<String>,
+    diagnostics: Option<Diagnostics>,
 }
 
 impl<'a> MessageBuilder<'a> {
@@ -72,9 +69,6 @@ impl<'a> MessageBuilder<'a> {
             max_tokens: None,
             messages: Vec::new(),
             system: None,
-            temperature: None,
-            top_p: None,
-            top_k: None,
             stop_sequences: None,
             stream: None,
             tools: None,
@@ -84,6 +78,8 @@ impl<'a> MessageBuilder<'a> {
             output_config: None,
             thinking: None,
             service_tier: None,
+            speed: None,
+            diagnostics: None,
         }
     }
 
@@ -152,6 +148,18 @@ impl<'a> MessageBuilder<'a> {
         self
     }
 
+    /// Append a mid-conversation system message (role `system`).
+    ///
+    /// For the initial system prompt use [`system`](Self::system).
+    #[must_use]
+    pub fn system_message(mut self, text: &str) -> Self {
+        self.messages.push(Message {
+            role: Role::System,
+            content: MessageContent::Text(text.to_string()),
+        });
+        self
+    }
+
     // ----- system prompt ----------------------------------------------------
 
     /// Set a plain-text system prompt.
@@ -185,27 +193,6 @@ impl<'a> MessageBuilder<'a> {
     }
 
     // ----- optional parameters ----------------------------------------------
-
-    /// Set the sampling temperature (0.0 to 1.0).
-    #[must_use]
-    pub fn temperature(mut self, t: f64) -> Self {
-        self.temperature = Some(t);
-        self
-    }
-
-    /// Set top-p (nucleus) sampling.
-    #[must_use]
-    pub fn top_p(mut self, p: f64) -> Self {
-        self.top_p = Some(p);
-        self
-    }
-
-    /// Set top-k sampling (only sample from top K options per token).
-    #[must_use]
-    pub fn top_k(mut self, k: u32) -> Self {
-        self.top_k = Some(k);
-        self
-    }
 
     /// Set one or more stop sequences.
     #[must_use]
@@ -253,6 +240,14 @@ impl<'a> MessageBuilder<'a> {
         self
     }
 
+    /// Add a toolset entry (computer or browser tool family).
+    #[must_use]
+    pub fn toolset(mut self, toolset: Toolset) -> Self {
+        let tools = self.tools.get_or_insert_with(Vec::new);
+        tools.push(ToolDefinition::Toolset(toolset));
+        self
+    }
+
     /// Provide multiple tool definitions (custom and/or server tools).
     #[must_use]
     pub fn tools(mut self, tools: Vec<ToolDefinition>) -> Self {
@@ -274,25 +269,39 @@ impl<'a> MessageBuilder<'a> {
         self
     }
 
-    /// Enable extended thinking with a specific token budget.
+    /// Enable manual extended thinking with a specific token budget.
     ///
-    /// The budget must be >= 1024 and less than `max_tokens`.
+    /// The budget must be >= 1024 and less than `max_tokens`. Manual thinking
+    /// is deprecated on Claude Opus 4.6 and Sonnet 4.6 and rejected by later
+    /// models; use [`thinking_adaptive`](Self::thinking_adaptive) there.
     #[must_use]
     pub fn thinking(mut self, budget_tokens: u32) -> Self {
-        self.thinking = Some(ThinkingConfig::Enabled { budget_tokens });
+        self.thinking = Some(ThinkingConfig::Enabled {
+            budget_tokens,
+            display: None,
+        });
         self
     }
 
-    /// Enable adaptive thinking (recommended for Claude Opus 4.6).
-    ///
-    /// The model decides whether and how much to think.
+    /// Enable adaptive thinking: the model decides when and how much to
+    /// think.
     #[must_use]
     pub fn thinking_adaptive(mut self, budget_tokens: Option<u32>) -> Self {
-        self.thinking = Some(ThinkingConfig::Adaptive { budget_tokens });
+        self.thinking = Some(ThinkingConfig::Adaptive {
+            budget_tokens,
+            display: None,
+        });
         self
     }
 
-    /// Set the full thinking configuration.
+    /// Turn off up-front thinking; the model thinks only between tool calls.
+    #[must_use]
+    pub fn thinking_between_tools(mut self) -> Self {
+        self.thinking = Some(ThinkingConfig::BetweenTools {});
+        self
+    }
+
+    /// Set the full thinking configuration (e.g. to set `display`).
     #[must_use]
     pub fn thinking_config(mut self, config: ThinkingConfig) -> Self {
         self.thinking = Some(config);
@@ -342,6 +351,29 @@ impl<'a> MessageBuilder<'a> {
         self
     }
 
+    /// Set the inference speed mode (`"standard"` or `"fast"`).
+    ///
+    /// Some models require the `fast-mode-2026-02-01` beta header for any
+    /// `speed` value.
+    #[must_use]
+    pub fn speed(mut self, speed: &str) -> Self {
+        self.speed = Some(speed.to_string());
+        self
+    }
+
+    /// Request prompt-cache diagnostics against a previous response.
+    ///
+    /// Pass the previous response's `id` to get
+    /// `diagnostics.cache_miss_reason` back, or `None` on the first turn to
+    /// opt in with nothing to compare against.
+    #[must_use]
+    pub fn diagnostics(mut self, previous_message_id: Option<&str>) -> Self {
+        self.diagnostics = Some(Diagnostics {
+            previous_message_id: previous_message_id.map(str::to_string),
+        });
+        self
+    }
+
     // ----- build ------------------------------------------------------------
 
     /// Build the [`CreateMessageRequest`] without sending it.
@@ -369,9 +401,6 @@ impl<'a> MessageBuilder<'a> {
             max_tokens,
             messages: self.messages,
             system: self.system,
-            temperature: self.temperature,
-            top_p: self.top_p,
-            top_k: self.top_k,
             stop_sequences: self.stop_sequences,
             stream: self.stream,
             tools: self.tools,
@@ -381,6 +410,8 @@ impl<'a> MessageBuilder<'a> {
             output_config: self.output_config,
             thinking: self.thinking,
             service_tier: self.service_tier,
+            speed: self.speed,
+            diagnostics: self.diagnostics,
         })
     }
 
@@ -444,7 +475,6 @@ mod tests {
         assert_eq!(req.max_tokens, 1024);
         assert_eq!(req.messages.len(), 1);
         assert!(req.system.is_none());
-        assert!(req.temperature.is_none());
         assert!(req.thinking.is_none());
         assert!(req.tools.is_none());
     }
@@ -525,45 +555,104 @@ mod tests {
     }
 
     #[test]
-    fn build_with_temperature() {
-        let client = test_client();
-        let req = client
+    fn sampling_parameters_are_never_sent() {
+        let req = test_client()
             .messages()
             .model("m")
             .max_tokens(1)
             .user("x")
-            .temperature(0.7)
             .build()
             .unwrap();
-        assert_eq!(req.temperature, Some(0.7));
+        let json = serde_json::to_value(&req).unwrap();
+        for removed in ["temperature", "top_p", "top_k"] {
+            assert!(json.get(removed).is_none(), "{removed} must not be sent");
+        }
     }
 
     #[test]
-    fn build_with_top_p() {
-        let client = test_client();
-        let req = client
+    fn build_with_speed() {
+        let req = test_client()
             .messages()
             .model("m")
             .max_tokens(1)
             .user("x")
-            .top_p(0.9)
+            .speed("fast")
             .build()
             .unwrap();
-        assert_eq!(req.top_p, Some(0.9));
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["speed"], "fast");
     }
 
     #[test]
-    fn build_with_top_k() {
-        let client = test_client();
-        let req = client
+    fn diagnostics_first_turn_sends_explicit_null() {
+        let req = test_client()
             .messages()
             .model("m")
             .max_tokens(1)
             .user("x")
-            .top_k(40)
+            .diagnostics(None)
             .build()
             .unwrap();
-        assert_eq!(req.top_k, Some(40));
+        let json = serde_json::to_value(&req).unwrap();
+        let diagnostics = json["diagnostics"].as_object().unwrap();
+        assert!(diagnostics.contains_key("previous_message_id"));
+        assert!(diagnostics["previous_message_id"].is_null());
+    }
+
+    #[test]
+    fn diagnostics_with_previous_message_id() {
+        let req = test_client()
+            .messages()
+            .model("m")
+            .max_tokens(1)
+            .user("x")
+            .diagnostics(Some("msg_prev"))
+            .build()
+            .unwrap();
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["diagnostics"]["previous_message_id"], "msg_prev");
+    }
+
+    #[test]
+    fn system_message_appends_system_role_in_order() {
+        let req = test_client()
+            .messages()
+            .model("m")
+            .max_tokens(1)
+            .user("first")
+            .assistant("reply")
+            .system_message("Switch to French.")
+            .user("second")
+            .build()
+            .unwrap();
+        let json = serde_json::to_value(&req).unwrap();
+        let roles: Vec<&str> = json["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "system", "user"]);
+        assert_eq!(json["messages"][2]["content"], "Switch to French.");
+        // The top-level system prompt is untouched.
+        assert!(json.get("system").is_none());
+    }
+
+    #[test]
+    fn build_with_between_tools_thinking() {
+        let req = test_client()
+            .messages()
+            .model("m")
+            .max_tokens(1)
+            .user("x")
+            .thinking_between_tools()
+            .build()
+            .unwrap();
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            json["thinking"],
+            serde_json::json!({"type": "between_tools"})
+        );
     }
 
     #[test]
@@ -593,7 +682,7 @@ mod tests {
             .unwrap();
 
         match req.thinking {
-            Some(ThinkingConfig::Enabled { budget_tokens }) => {
+            Some(ThinkingConfig::Enabled { budget_tokens, .. }) => {
                 assert_eq!(budget_tokens, 10000);
             }
             _ => panic!("expected Enabled thinking"),
@@ -613,7 +702,7 @@ mod tests {
             .unwrap();
 
         match req.thinking {
-            Some(ThinkingConfig::Adaptive { budget_tokens }) => {
+            Some(ThinkingConfig::Adaptive { budget_tokens, .. }) => {
                 assert_eq!(budget_tokens, Some(5000));
             }
             _ => panic!("expected Adaptive thinking"),
@@ -809,6 +898,7 @@ mod tests {
                     url: "https://example.com/img.jpg".into(),
                 },
                 cache_control: None,
+                transformations: None,
             },
         ];
         let req = client
@@ -834,7 +924,6 @@ mod tests {
             .max_tokens(1024)
             .system("Be helpful.")
             .user("Hi")
-            .temperature(0.5)
             .thinking(5000)
             .build()
             .unwrap();
@@ -843,10 +932,9 @@ mod tests {
         assert_eq!(json["model"], "claude-haiku-4-5");
         assert_eq!(json["max_tokens"], 1024);
         assert_eq!(json["system"], "Be helpful.");
-        assert_eq!(json["temperature"], 0.5);
         assert_eq!(json["thinking"]["type"], "enabled");
         assert_eq!(json["thinking"]["budget_tokens"], 5000);
-        assert!(json.get("top_k").is_none()); // Optional, not set
+        assert!(json["thinking"].get("display").is_none()); // Optional, not set
         assert!(json.get("stream").is_none()); // Optional, not set
     }
 }

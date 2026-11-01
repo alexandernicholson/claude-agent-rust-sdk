@@ -22,7 +22,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_tokens(1024)
         .system("You are a friendly assistant. Keep answers brief.")
         .user("What are three interesting facts about Rust the programming language?")
-        .temperature(0.7)
         .send()
         .await?;
 

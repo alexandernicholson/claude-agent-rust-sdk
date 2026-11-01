@@ -42,9 +42,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )),
                 }],
                 system: None,
-                temperature: None,
-                top_p: None,
-                top_k: None,
                 stop_sequences: None,
                 stream: None,
                 tools: None,
@@ -54,6 +51,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 output_config: None,
                 thinking: None,
                 service_tier: None,
+                speed: None,
+                diagnostics: None,
             },
         })
         .collect();

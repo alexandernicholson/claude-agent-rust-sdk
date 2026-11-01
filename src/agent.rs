@@ -5,6 +5,7 @@
 //! crate owns typed messages, the initialization handshake, permission gates,
 //! and in-process MCP tool dispatch.
 
+use crate::agent_runtime::RuntimeEvent;
 use crate::error::ClaudeError;
 use crate::extensions::{
     AgentDefinition, CanUseTool, CanUseToolShadowedWarning, HookEvent, HookMatcher,
@@ -161,7 +162,8 @@ pub struct AgentOptions {
     pub user: Option<String>,
     /// Include partial assistant events in the message stream.
     pub include_partial_messages: bool,
-    /// Include hook lifecycle events in the message stream.
+    /// Include hook lifecycle events in the message stream. The `SessionStart`
+    /// and `Setup` hook events are emitted regardless of this setting.
     pub include_hook_events: bool,
     /// Fork resumed sessions to a new session identifier.
     pub fork_session: bool,
@@ -198,6 +200,15 @@ pub struct AgentOptions {
     pub load_timeout_ms: u64,
     /// API-side task budget in tokens.
     pub task_budget: Option<TaskBudget>,
+    /// Forward assistant text produced inside subagents to the message stream
+    /// (initialize request `forwardSubagentText: true`).
+    pub forward_subagent_text: bool,
+    /// Mark every outgoing user message `client_composed: true` so the CLI
+    /// delivers it as written: no `@path` expansion and no slash-command
+    /// dispatch. Applies to string prompts and streamed user frames alike,
+    /// overwriting any caller-supplied `client_composed`. Requires CLI
+    /// 2.1.248 or newer.
+    pub verbatim_prompts: bool,
     /// Timeout for the initialize control request.
     pub initialize_timeout: Duration,
 }
@@ -260,6 +271,8 @@ impl fmt::Debug for AgentOptions {
             .field("session_store_flush", &self.session_store_flush)
             .field("load_timeout_ms", &self.load_timeout_ms)
             .field("task_budget", &self.task_budget)
+            .field("forward_subagent_text", &self.forward_subagent_text)
+            .field("verbatim_prompts", &self.verbatim_prompts)
             .field("initialize_timeout", &self.initialize_timeout)
             .finish()
     }
@@ -316,6 +329,8 @@ impl Default for AgentOptions {
             session_store_flush: SessionStoreFlushMode::default(),
             load_timeout_ms: 60_000,
             task_budget: None,
+            forward_subagent_text: false,
+            verbatim_prompts: false,
             initialize_timeout: Duration::from_mins(1),
         }
     }
@@ -532,9 +547,11 @@ pub trait AgentTransport: fmt::Debug + Send + Sync + 'static {
 /// MCP tool safety hints shown to the model and host.
 ///
 /// Mirrors the official `mcp.types.ToolAnnotations` plus the Anthropic-specific
-/// `maxResultSizeChars` hint. The size hint is not a standard annotation field:
-/// the MCP schema strips unknown annotation keys, so it is emitted separately
-/// under the tool's `_meta` as `anthropic/maxResultSizeChars`.
+/// `maxResultSizeChars` hint. Every hint is accepted on input in camelCase
+/// (`readOnlyHint`) or `snake_case` (`read_only_hint`) and always serialized in
+/// camelCase. The size hint is not a standard annotation field: the MCP schema
+/// strips unknown annotation keys, so it is emitted separately under the
+/// tool's `_meta` as `anthropic/maxResultSizeChars`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolAnnotations {
@@ -542,20 +559,21 @@ pub struct ToolAnnotations {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     /// Tool only reads external state.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "read_only_hint")]
     pub read_only_hint: Option<bool>,
     /// Tool can perform a destructive operation.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "destructive_hint")]
     pub destructive_hint: Option<bool>,
     /// Repeating an identical invocation is safe.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "idempotent_hint")]
     pub idempotent_hint: Option<bool>,
     /// Tool can communicate with arbitrary external systems.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "open_world_hint")]
     pub open_world_hint: Option<bool>,
     /// Anthropic-specific tool-result spill threshold (characters). Emitted in
     /// `_meta` (never as a wire annotation) as `anthropic/maxResultSizeChars`.
-    #[serde(skip)]
+    /// Accepted on input but never serialized into `annotations`.
+    #[serde(skip_serializing, alias = "max_result_size_chars")]
     pub max_result_size_chars: Option<u64>,
 }
 
@@ -747,6 +765,36 @@ impl fmt::Debug for SdkMcpTool {
 }
 
 impl SdkMcpTool {
+    /// Render this tool as a `tools/list` entry.
+    fn to_list_entry(&self) -> Value {
+        let mut entry = serde_json::Map::new();
+        entry.insert("name".into(), json!(self.name));
+        entry.insert("description".into(), json!(self.description));
+        entry.insert("inputSchema".into(), self.input_schema.clone());
+        // Annotations are optional and omitted when absent, matching the
+        // official bridge; the size hint is not a wire annotation so it never
+        // appears here.
+        if let Some(annotations) = &self.annotations {
+            entry.insert(
+                "annotations".into(),
+                serde_json::to_value(annotations).unwrap_or(Value::Null),
+            );
+        }
+        // maxResultSizeChars rides in _meta under a namespaced key (the MCP
+        // schema strips unknown annotation fields).
+        if let Some(max) = self
+            .annotations
+            .as_ref()
+            .and_then(|a| a.max_result_size_chars)
+        {
+            entry.insert(
+                "_meta".into(),
+                json!({ "anthropic/maxResultSizeChars": max }),
+            );
+        }
+        Value::Object(entry)
+    }
+
     /// Define an in-process MCP tool.
     ///
     /// Annotations are optional, matching the official
@@ -799,6 +847,7 @@ pub struct SdkMcpServer {
     name: String,
     version: String,
     tools: BTreeMap<String, SdkMcpTool>,
+    inflight: InflightCalls,
 }
 
 impl SdkMcpServer {
@@ -823,6 +872,7 @@ impl SdkMcpServer {
             name,
             version: version.into(),
             tools: BTreeMap::new(),
+            inflight: InflightCalls::default(),
         })
     }
 
@@ -853,6 +903,11 @@ impl SdkMcpServer {
     }
 
     /// Dispatch one inbound MCP JSON-RPC message and return the JSON-RPC reply.
+    ///
+    /// A `notifications/cancelled` message abandons the in-flight `tools/call`
+    /// with the matching `requestId`: the tool future is dropped and that
+    /// call is answered with a `-32800` error. Reusing the id of a call that is
+    /// still running is refused with `-32600`.
     pub(crate) async fn handle(&self, message: &Value) -> Value {
         let id = message.get("id").cloned().unwrap_or(Value::Null);
         let method = message.get("method").and_then(Value::as_str).unwrap_or("");
@@ -862,43 +917,26 @@ impl SdkMcpServer {
                 "id": id,
                 "result": {
                     "protocolVersion": MCP_PROTOCOL_VERSION,
-                    "capabilities": {"tools": {}},
+                    "capabilities": {"experimental": {}, "tools": {"listChanged": false}},
                     "serverInfo": {"name": self.name, "version": self.version}
                 }
             }),
             "notifications/initialized" => json!({"jsonrpc": "2.0", "result": {}}),
+            "notifications/cancelled" => {
+                if let Some(request_id) = message.get("params").and_then(|p| p.get("requestId")) {
+                    if let Some((_, cancel)) = self.inflight.lock().remove(&request_id.to_string())
+                    {
+                        let _ = cancel.send(());
+                    }
+                }
+                json!({"jsonrpc": "2.0", "result": {}})
+            }
+            "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
             "tools/list" => {
                 let tools = self
                     .tools
                     .values()
-                    .map(|tool| {
-                        let mut entry = serde_json::Map::new();
-                        entry.insert("name".into(), json!(tool.name));
-                        entry.insert("description".into(), json!(tool.description));
-                        entry.insert("inputSchema".into(), tool.input_schema.clone());
-                        // Annotations are optional and omitted when absent,
-                        // matching the official bridge; the size hint is not a
-                        // wire annotation so it never appears here.
-                        if let Some(annotations) = &tool.annotations {
-                            entry.insert(
-                                "annotations".into(),
-                                serde_json::to_value(annotations).unwrap_or(Value::Null),
-                            );
-                        }
-                        // maxResultSizeChars rides in _meta under a namespaced
-                        // key (the MCP schema strips unknown annotation fields).
-                        if let Some(max) = tool
-                            .annotations
-                            .as_ref()
-                            .and_then(|a| a.max_result_size_chars)
-                        {
-                            entry.insert(
-                                "_meta".into(),
-                                json!({ "anthropic/maxResultSizeChars": max }),
-                            );
-                        }
-                        Value::Object(entry)
-                    })
+                    .map(SdkMcpTool::to_list_entry)
                     .collect::<Vec<_>>();
                 json!({"jsonrpc": "2.0", "id": id, "result": {"tools": tools}})
             }
@@ -917,7 +955,29 @@ impl SdkMcpServer {
                 let Some(tool) = self.tools.get(name) else {
                     return mcp_error(&id, -32_601, &format!("tool '{name}' not found"));
                 };
-                match (tool.handler)(arguments).await {
+                let key = id.to_string();
+                let generation =
+                    NEXT_INFLIGHT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+                {
+                    let mut inflight = self.inflight.lock();
+                    if inflight.contains_key(&key) {
+                        return mcp_error(&id, -32_600, "request id is already in flight");
+                    }
+                    inflight.insert(key.clone(), (generation, cancel_tx));
+                }
+                // Deregisters on completion and when this future is dropped
+                // (control-level cancellation).
+                let _guard = InflightGuard {
+                    calls: &self.inflight,
+                    key,
+                    generation,
+                };
+                let outcome = tokio::select! {
+                    result = (tool.handler)(arguments) => result,
+                    _ = cancel_rx => return mcp_error(&id, -32_800, "request cancelled"),
+                };
+                match outcome {
                     Ok(result) => {
                         json!({"jsonrpc": "2.0", "id": id, "result": result.to_mcp_result()})
                     }
@@ -929,6 +989,33 @@ impl SdkMcpServer {
                 }
             }
             _ => mcp_error(&id, -32_601, &format!("method '{method}' not found")),
+        }
+    }
+}
+
+/// In-flight `tools/call` requests keyed by serialized JSON-RPC id, each with
+/// a registration generation and a cancellation trigger.
+type InflightCalls =
+    Arc<parking_lot::Mutex<HashMap<String, (u64, tokio::sync::oneshot::Sender<()>)>>>;
+
+static NEXT_INFLIGHT_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Removes an in-flight registration unless a newer call already replaced it.
+struct InflightGuard<'a> {
+    calls: &'a parking_lot::Mutex<HashMap<String, (u64, tokio::sync::oneshot::Sender<()>)>>,
+    key: String,
+    generation: u64,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        let mut calls = self.calls.lock();
+        if calls
+            .get(&self.key)
+            .is_some_and(|(generation, _)| *generation == self.generation)
+        {
+            calls.remove(&self.key);
         }
     }
 }
@@ -1087,6 +1174,184 @@ pub struct SystemAgentMessage {
     pub subtype: String,
     /// Complete event payload for forward compatibility.
     pub data: Value,
+}
+
+impl SystemAgentMessage {
+    /// Decode the typed payload of a `system`/`init` message.
+    ///
+    /// Returns `None` when this is not an `init` message, and
+    /// `Some(Err(_))` when an `init` payload lacks a required field or has a
+    /// mistyped one. Extra fields are ignored; the complete payload stays in
+    /// [`SystemAgentMessage::data`].
+    #[must_use]
+    pub fn init_data(&self) -> Option<Result<SystemInitData, serde_json::Error>> {
+        (self.subtype == "init").then(|| SystemInitData::deserialize(&self.data))
+    }
+}
+
+/// An MCP server listed in [`SystemInitData`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SystemInitMcpServer {
+    /// Server name.
+    pub name: String,
+    /// Connection status (for example `connected`, `failed`, `pending`).
+    pub status: String,
+    /// Where the definition came from: `sdk`, `plugin`, or a config scope such
+    /// as `user` or `project`. Absent on CLIs that predate the field.
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// A loaded plugin listed in [`SystemInitData`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SystemInitPlugin {
+    /// Plugin name.
+    pub name: String,
+    /// Plugin directory path.
+    pub path: String,
+    /// Version declared in the plugin manifest, verbatim; absent when the
+    /// manifest declares none.
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+/// A plugin load failure listed in [`SystemInitData`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SystemInitPluginError {
+    /// `name@marketplace`, or a positional tag such as `inline[0]` or
+    /// `synced[0]` when a directory entry failed before it had a name.
+    pub plugin: String,
+    /// Failure category from an open set (for example `path-not-found`,
+    /// `manifest-validation-error`); treat unknown values as a generic failure.
+    #[serde(rename = "type")]
+    pub error_type: String,
+    /// Human-readable failure message.
+    pub message: String,
+    /// Present only when a `plugins`, `--plugin-dir` or synced directory entry
+    /// did not load at all: that entry's path, resolved against the cwd.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// Fast mode state reported in [`SystemInitData`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FastModeState {
+    /// Fast mode is off.
+    Off,
+    /// Fast mode is cooling down.
+    Cooldown,
+    /// Fast mode is on.
+    On,
+    /// A value this SDK does not know (newer CLI).
+    #[serde(other)]
+    Other,
+}
+
+/// Why fast mode cannot serve right now, reported in [`SystemInitData`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FastModeDisabledReason {
+    /// Free plan.
+    Free,
+    /// Disabled by user preference.
+    Preference,
+    /// Extra usage is disabled.
+    ExtraUsageDisabled,
+    /// Network error while checking.
+    NetworkError,
+    /// Unknown reason (the CLI's own `unknown` value).
+    Unknown,
+    /// Not a first-party provider.
+    NotFirstParty,
+    /// Disabled through an environment variable.
+    DisabledByEnv,
+    /// The model is not allowed.
+    ModelNotAllowed,
+    /// The SDK has to opt in.
+    SdkOptInRequired,
+    /// Check still pending.
+    Pending,
+    /// A value this SDK does not know (newer CLI).
+    #[serde(other)]
+    Other,
+}
+
+/// Typed payload of a `system`/`init` message, with the wire key names the CLI
+/// sends. Obtain it with [`SystemAgentMessage::init_data`].
+///
+/// `effort` and fields outside the public reference are intentionally left
+/// out; read them from [`SystemAgentMessage::data`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SystemInitData {
+    /// Always `system`.
+    #[serde(rename = "type")]
+    pub message_type: String,
+    /// Always `init`.
+    pub subtype: String,
+    /// Message identifier.
+    pub uuid: String,
+    /// Claude session identifier.
+    pub session_id: String,
+    /// Available agent names.
+    #[serde(default)]
+    pub agents: Option<Vec<String>>,
+    /// Where the API credential came from: `ANTHROPIC_API_KEY`,
+    /// `apiKeyHelper`, `/login managed key`, or `none`.
+    #[serde(rename = "apiKeySource")]
+    pub api_key_source: String,
+    /// Enabled beta features.
+    #[serde(default)]
+    pub betas: Option<Vec<String>>,
+    /// Claude Code CLI version.
+    pub claude_code_version: String,
+    /// Working directory.
+    pub cwd: String,
+    /// Available tool names.
+    pub tools: Vec<String>,
+    /// MCP servers and their status.
+    pub mcp_servers: Vec<SystemInitMcpServer>,
+    /// Active model.
+    pub model: String,
+    /// Active permission mode.
+    #[serde(rename = "permissionMode")]
+    pub permission_mode: PermissionMode,
+    /// Available slash commands.
+    pub slash_commands: Vec<String>,
+    /// Entries of `slash_commands` bound to the local terminal (for example
+    /// `exit`); present only when non-empty.
+    #[serde(default)]
+    pub terminal_slash_commands: Option<Vec<String>>,
+    /// Active output style.
+    pub output_style: String,
+    /// Available skills.
+    pub skills: Vec<String>,
+    /// Loaded plugins.
+    pub plugins: Vec<SystemInitPlugin>,
+    /// Plugin load failures. An absent key does not by itself assert a clean
+    /// load (older CLIs and some hosted sessions never send it).
+    #[serde(default)]
+    pub plugin_errors: Option<Vec<SystemInitPluginError>>,
+    /// Fast mode state.
+    #[serde(default)]
+    pub fast_mode_state: Option<FastModeState>,
+    /// The check that blocks fast mode, when something does.
+    #[serde(default)]
+    pub fast_mode_disabled_reason: Option<FastModeDisabledReason>,
+    /// Protocol capabilities this CLI supports (for example
+    /// `interrupt_receipt_v1`); open set. Absent on CLIs before 2.1.205.
+    #[serde(default)]
+    pub capabilities: Option<Vec<String>>,
+}
+
+impl SystemInitData {
+    /// Whether the CLI advertised `capability` in its init message.
+    #[must_use]
+    pub fn has_capability(&self, capability: &str) -> bool {
+        self.capabilities
+            .as_deref()
+            .is_some_and(|list| list.iter().any(|entry| entry == capability))
+    }
 }
 
 /// Task lifecycle: a task started.
@@ -1978,6 +2243,74 @@ mod agent_parser_tests {
     }
 
     #[test]
+    fn system_init_message_exposes_typed_payload() {
+        let frame = json!({
+            "type": "system", "subtype": "init",
+            "uuid": "u-1", "session_id": "s-1",
+            "agents": ["general-purpose"],
+            "apiKeySource": "none",
+            "claude_code_version": "2.1.316",
+            "cwd": "/work",
+            "tools": ["Bash", "Read"],
+            "mcp_servers": [
+                {"name": "calc", "status": "connected", "source": "sdk"},
+                {"name": "old", "status": "pending"}
+            ],
+            "model": "claude-sonnet-4-6",
+            "permissionMode": "acceptEdits",
+            "slash_commands": ["compact", "exit"],
+            "terminal_slash_commands": ["exit"],
+            "output_style": "default",
+            "skills": [],
+            "plugins": [{"name": "p", "path": "/p", "version": "1.0"}, {"name": "q", "path": "/q"}],
+            "plugin_errors": [
+                {"plugin": "inline[0]", "type": "path-not-found", "message": "nope", "path": "/x"}
+            ],
+            "fast_mode_state": "cooldown",
+            "fast_mode_disabled_reason": "from_the_future",
+            "capabilities": ["interrupt_receipt_v1"],
+            "brand_new_field": {"ignored": true}
+        });
+        let Some(AgentMessage::System(system)) = parse(frame) else {
+            panic!("expected system");
+        };
+        let init = system.init_data().expect("init subtype").expect("typed");
+        assert_eq!(init.session_id, "s-1");
+        assert_eq!(init.api_key_source, "none");
+        assert_eq!(init.permission_mode, PermissionMode::AcceptEdits);
+        assert_eq!(init.mcp_servers[0].source.as_deref(), Some("sdk"));
+        assert_eq!(init.mcp_servers[1].source, None);
+        assert_eq!(init.plugins[0].version.as_deref(), Some("1.0"));
+        assert_eq!(init.plugins[1].version, None);
+        let error = &init.plugin_errors.as_ref().unwrap()[0];
+        assert_eq!(error.error_type, "path-not-found");
+        assert_eq!(error.path.as_deref(), Some("/x"));
+        assert_eq!(init.fast_mode_state, Some(FastModeState::Cooldown));
+        assert_eq!(
+            init.fast_mode_disabled_reason,
+            Some(FastModeDisabledReason::Other)
+        );
+        assert!(init.has_capability("interrupt_receipt_v1"));
+        assert!(!init.has_capability("other"));
+        // Raw payload stays available.
+        assert_eq!(system.data["brand_new_field"]["ignored"], json!(true));
+    }
+
+    #[test]
+    fn init_data_is_none_for_other_subtypes_and_errors_on_malformed_init() {
+        let other = SystemAgentMessage {
+            subtype: "status".into(),
+            data: json!({"type": "system", "subtype": "status"}),
+        };
+        assert!(other.init_data().is_none());
+        let malformed = SystemAgentMessage {
+            subtype: "init".into(),
+            data: json!({"type": "system", "subtype": "init"}),
+        };
+        assert!(malformed.init_data().unwrap().is_err());
+    }
+
+    #[test]
     fn parse_task_lifecycle_messages() {
         let started = parse(json!({
             "type": "system", "subtype": "task_started",
@@ -2468,17 +2801,22 @@ impl<T: AgentTransport> ClaudeAgentClient<T> {
         session_id: &str,
     ) -> Result<(), ClaudeError> {
         let runtime = self.runtime().await?;
-        let frame = json!({
+        let mut frame = json!({
             "type": "user",
             "message": {"role": "user", "content": prompt.into()},
             "parent_tool_use_id": Value::Null,
             "session_id": session_id,
         });
+        if self.options.verbatim_prompts {
+            stamp_client_composed(&mut frame);
+        }
         runtime.write_frame(&frame).await
     }
 
     /// Stream a sequence of pre-built user frames, filling in a session id where
     /// a frame omits one, matching the stateful Python async-iterable path.
+    /// With [`AgentOptions::verbatim_prompts`] every `user` frame is stamped
+    /// `client_composed: true`, overwriting any caller value.
     ///
     /// # Errors
     ///
@@ -2494,6 +2832,9 @@ impl<T: AgentTransport> ClaudeAgentClient<T> {
             if let Value::Object(map) = &mut frame {
                 map.entry("session_id".to_string())
                     .or_insert_with(|| Value::String(session_id.to_owned()));
+            }
+            if self.options.verbatim_prompts {
+                stamp_client_composed(&mut frame);
             }
             runtime.write_frame(&frame).await?;
         }
@@ -2543,9 +2884,17 @@ impl<T: AgentTransport> ClaudeAgentClient<T> {
     ///
     /// This is the convenience one-shot surface used by LADAA. It writes the
     /// prompt, then drains the correct run boundary: for a plain session it
-    /// stops at the first result; with hooks or SDK MCP servers configured it
-    /// continues through intermediate results (delegated-task turns) until a
-    /// run-ending result arrives, matching the deferred stdin-closure contract.
+    /// stops at the first result. With hooks, SDK MCP servers, or a
+    /// `can_use_tool` callback configured the run only ends once the CLI
+    /// reports `idle` after a result (stdin stays open meanwhile so control
+    /// requests keep being served), bounded by
+    /// `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` (default 10 minutes, `0` = no
+    /// limit); a CLI that sends no session state ends the run at the first
+    /// result with no delegated task in flight. Intermediate results are
+    /// aggregated and the run-ending one is returned.
+    ///
+    /// A string prompt works with `can_use_tool`: the permission callback is
+    /// served over the control protocol for the whole run.
     ///
     /// # Errors
     ///
@@ -2555,35 +2904,44 @@ impl<T: AgentTransport> ClaudeAgentClient<T> {
         let runtime = self.runtime().await?;
         self.send(prompt).await?;
 
-        // With hooks/MCP the run may span multiple result frames (delegated
-        // tasks keep stdin open); otherwise the first result ends the run.
+        // With control-request needs the run may span multiple result frames
+        // (follow-up turns keep stdin open); otherwise the first result ends
+        // the run.
         let defer = runtime.defers_end_input();
         let mut assistant_text = String::new();
+        let mut pending_result: Option<ResultAgentMessage> = None;
         loop {
-            let (message, run_ended) = runtime.receive_annotated().await?.ok_or_else(|| {
-                ClaudeError::CliConnection(
-                    "Claude Code ended before emitting an Agent SDK result".into(),
-                )
-            })?;
-            match message {
-                AgentMessage::Assistant(assistant) => {
+            let Some(event) = runtime.receive_event().await? else {
+                // A result already seen still ends the run when the stream
+                // closes before the run-end marker.
+                return pending_result
+                    .map(|result| build_run_result(result, assistant_text))
+                    .ok_or_else(|| {
+                        ClaudeError::CliConnection(
+                            "Claude Code ended before emitting an Agent SDK result".into(),
+                        )
+                    });
+            };
+            match event {
+                RuntimeEvent::Message(AgentMessage::Assistant(assistant)) => {
                     for block in assistant.content {
                         if let AgentContentBlock::Text { text } = block {
                             assistant_text.push_str(&text);
                         }
                     }
                 }
-                AgentMessage::Result(result)
-                    // Without deferral, the first result ends the run. With
-                    // hooks/MCP a result only ends the run once the reader's
-                    // task ledger is empty (`run_ended`); intermediate results
-                    // are aggregated and draining continues until the
-                    // run-ending one. The flag is computed by the reader at the
-                    // moment it emitted this exact result, so it is race-free.
-                    if (!defer || run_ended) => {
+                RuntimeEvent::Message(AgentMessage::Result(result)) => {
+                    if !defer {
                         return Ok(build_run_result(result, assistant_text));
                     }
-                _ => {}
+                    pending_result = Some(result);
+                }
+                RuntimeEvent::RunEnded => {
+                    if let Some(result) = pending_result.take() {
+                        return Ok(build_run_result(result, assistant_text));
+                    }
+                }
+                RuntimeEvent::Message(_) => {}
             }
         }
     }
@@ -2810,6 +3168,18 @@ impl<T: AgentTransport> Drop for ClaudeAgentClient<T> {
         // abort the reader synchronously so the child process is not leaked.
         if let Some(runtime) = self.runtime.get_mut().take() {
             runtime.abort_reader();
+        }
+    }
+}
+
+/// Mark an outgoing `user` frame `client_composed: true` so the CLI delivers
+/// it as written (no `@path` expansion, no slash-command dispatch). Any
+/// caller-supplied value is overwritten; non-`user` and non-object frames are
+/// left untouched.
+fn stamp_client_composed(frame: &mut Value) {
+    if let Value::Object(map) = frame {
+        if map.get("type").and_then(Value::as_str) == Some("user") {
+            map.insert("client_composed".to_owned(), Value::Bool(true));
         }
     }
 }
@@ -3192,6 +3562,82 @@ mod tests {
         // maxResultSizeChars must not appear as an annotation.
         assert!(sized["annotations"].get("maxResultSizeChars").is_none());
         assert_eq!(sized["_meta"]["anthropic/maxResultSizeChars"], json!(2048));
+    }
+
+    #[test]
+    fn tool_annotations_accept_camel_and_snake_case_hints() {
+        let camel: ToolAnnotations = serde_json::from_value(json!({
+            "readOnlyHint": true, "destructiveHint": false,
+            "idempotentHint": true, "openWorldHint": false,
+            "maxResultSizeChars": 10
+        }))
+        .unwrap();
+        let snake: ToolAnnotations = serde_json::from_value(json!({
+            "read_only_hint": true, "destructive_hint": false,
+            "idempotent_hint": true, "open_world_hint": false,
+            "max_result_size_chars": 10
+        }))
+        .unwrap();
+        assert_eq!(camel, snake);
+        assert_eq!(camel.read_only_hint, Some(true));
+        assert_eq!(camel.max_result_size_chars, Some(10));
+        // Serialized form is camelCase and never carries the size hint.
+        let wire = serde_json::to_value(&snake).unwrap();
+        assert_eq!(wire["readOnlyHint"], json!(true));
+        assert!(wire.get("read_only_hint").is_none());
+        assert!(wire.get("maxResultSizeChars").is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_notification_abandons_in_flight_tool_call() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started_in_tool = Arc::clone(&started);
+        let slow = SdkMcpTool::new("slow", "d", json!({"type": "object"}), None, move |_| {
+            let started = Arc::clone(&started_in_tool);
+            async move {
+                started.notify_one();
+                std::future::pending::<()>().await;
+                Ok(ToolCallResult::text("never"))
+            }
+        })
+        .unwrap();
+        let mut server = SdkMcpServer::new("srv", "1.0.0").unwrap();
+        server.add_tool(slow).unwrap();
+        let call = json!({
+            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": {"name": "slow", "arguments": {}}
+        });
+        let pending = {
+            let server = server.clone();
+            let call = call.clone();
+            tokio::spawn(async move { server.handle(&call).await })
+        };
+        started.notified().await;
+        // A second call reusing the in-flight id is refused.
+        let duplicate = server.handle(&call).await;
+        assert_eq!(duplicate["error"]["code"], json!(-32_600));
+
+        let ack = server
+            .handle(&json!({
+                "jsonrpc": "2.0", "method": "notifications/cancelled",
+                "params": {"requestId": 5}
+            }))
+            .await;
+        assert!(ack.get("error").is_none());
+        let response = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("cancelled call settles")
+            .unwrap();
+        assert_eq!(response["id"], json!(5));
+        assert_eq!(response["error"]["code"], json!(-32_800));
+
+        // The id is free again after the call settles.
+        let again = tokio::spawn({
+            let server = server.clone();
+            async move { server.handle(&call).await }
+        });
+        started.notified().await;
+        again.abort();
     }
 
     #[tokio::test]
@@ -3659,11 +4105,13 @@ mod tests {
         // The trailing process error is replaced by the result's error text.
         let err = client.receive_message().await.unwrap_err();
         match err {
-            ClaudeError::Process { message, .. } => {
-                assert!(message.contains("Claude Code returned an error result"));
-                assert!(message.contains("boom; bang"));
+            ClaudeError::ResultError(details) => {
+                assert!(details
+                    .message
+                    .contains("Claude Code returned an error result"));
+                assert!(details.message.contains("boom; bang"));
             }
-            other => panic!("expected Process error, got {other:?}"),
+            other => panic!("expected ResultError, got {other:?}"),
         }
         client.close().await.unwrap();
     }
@@ -3687,6 +4135,263 @@ mod tests {
             }
             other => panic!("expected Process error, got {other:?}"),
         }
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn result_error_carries_terminal_result_payload() {
+        let transport = MockTransport::new(true);
+        let mut client = ClaudeAgentClient::new(
+            TransportHandle(Arc::clone(&transport)),
+            AgentOptions::default(),
+        );
+        client.connect().await.unwrap();
+        client.send("q").await.unwrap();
+        transport.push(json!({
+            "type": "result",
+            "subtype": "success",
+            "duration_ms": 1,
+            "duration_api_ms": 1,
+            "is_error": true,
+            "num_turns": 1,
+            "session_id": "s9",
+            "result": "API Error: overloaded",
+            "errors": [],
+            "api_error_status": 529,
+            "terminal_reason": "api_error"
+        }));
+        transport.push_error("exit code 1");
+        let _ = client.receive_message().await.unwrap();
+        let err = client.receive_message().await.unwrap_err();
+        assert!(err.is_process());
+        assert_eq!(err.exit_code(), Some(1));
+        let ClaudeError::ResultError(details) = err else {
+            panic!("expected ResultError");
+        };
+        assert_eq!(details.subtype.as_deref(), Some("success"));
+        assert_eq!(details.result.as_deref(), Some("API Error: overloaded"));
+        assert_eq!(details.api_error_status, Some(529));
+        assert_eq!(details.terminal_reason.as_deref(), Some("api_error"));
+        assert_eq!(details.session_id.as_deref(), Some("s9"));
+        assert!(details.errors.is_empty());
+        assert!(details.message.ends_with(": API Error: overloaded"));
+        client.close().await.unwrap();
+    }
+
+    fn initialize_request(transport: &MockTransport) -> Value {
+        transport
+            .outgoing()
+            .into_iter()
+            .find_map(|frame| {
+                let request = frame.get("request")?;
+                (request.get("subtype").and_then(Value::as_str) == Some("initialize"))
+                    .then(|| request.clone())
+            })
+            .expect("initialize request must be written")
+    }
+
+    #[tokio::test]
+    async fn initialize_request_carries_forward_subagent_text_and_snapshot() {
+        let transport = MockTransport::new(true);
+        let mut client = ClaudeAgentClient::new(
+            TransportHandle(Arc::clone(&transport)),
+            AgentOptions {
+                forward_subagent_text: true,
+                system_prompt: Some(SystemPrompt::Custom {
+                    prompt: "be brief".into(),
+                    snapshot: Some(false),
+                }),
+                ..AgentOptions::default()
+            },
+        );
+        client.connect().await.unwrap();
+        let request = initialize_request(&transport);
+        assert_eq!(request["forwardSubagentText"], true);
+        assert_eq!(request["systemPromptSnapshot"], false);
+        client.close().await.unwrap();
+
+        let transport = MockTransport::new(true);
+        let mut client = ClaudeAgentClient::new(
+            TransportHandle(Arc::clone(&transport)),
+            AgentOptions::default(),
+        );
+        client.connect().await.unwrap();
+        let request = initialize_request(&transport);
+        assert!(request.get("forwardSubagentText").is_none());
+        assert!(request.get("systemPromptSnapshot").is_none());
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn verbatim_prompts_stamp_every_outgoing_user_frame() {
+        let user_frames = |transport: &MockTransport| -> Vec<Value> {
+            transport
+                .outgoing()
+                .into_iter()
+                .filter(|frame| frame["type"] == "user")
+                .collect()
+        };
+
+        let transport = MockTransport::new(true);
+        let mut client = ClaudeAgentClient::new(
+            TransportHandle(Arc::clone(&transport)),
+            AgentOptions {
+                verbatim_prompts: true,
+                ..AgentOptions::default()
+            },
+        );
+        client.connect().await.unwrap();
+        client.send("/compact").await.unwrap();
+        client
+            .send_stream(
+                [
+                    json!({"type": "user", "message": {"role": "user", "content": "a"}}),
+                    json!({"type": "user", "client_composed": false,
+                           "message": {"role": "user", "content": "b"}}),
+                ],
+                "s",
+            )
+            .await
+            .unwrap();
+        let frames = user_frames(&transport);
+        assert_eq!(frames.len(), 3);
+        assert!(frames.iter().all(|frame| frame["client_composed"] == true));
+        client.close().await.unwrap();
+
+        let transport = MockTransport::new(true);
+        let mut client = ClaudeAgentClient::new(
+            TransportHandle(Arc::clone(&transport)),
+            AgentOptions::default(),
+        );
+        client.connect().await.unwrap();
+        client.send("/compact").await.unwrap();
+        let frames = user_frames(&transport);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].get("client_composed").is_none());
+        client.close().await.unwrap();
+    }
+
+    fn session_state(state: &str, host_only: bool) -> Value {
+        let mut frame = json!({
+            "type": "system",
+            "subtype": "session_state_changed",
+            "state": state,
+            "session_id": "session-1",
+        });
+        if host_only {
+            frame["sdk_host_only"] = json!(true);
+        }
+        frame
+    }
+
+    fn permission_options(env: &[(&str, &str)]) -> (Arc<RecordingCallback>, AgentOptions) {
+        let callback = Arc::new(RecordingCallback {
+            calls: AtomicUsize::new(0),
+            result: StdMutex::new(PermissionResult::allow()),
+        });
+        let options = AgentOptions {
+            can_use_tool: Some(callback.clone()),
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            ..AgentOptions::default()
+        };
+        (callback, options)
+    }
+
+    #[tokio::test]
+    async fn can_use_tool_string_prompt_run_stays_open_until_idle() {
+        let transport = MockTransport::new(true);
+        let (callback, options) = permission_options(&[]);
+        let mut client = ClaudeAgentClient::new(TransportHandle(Arc::clone(&transport)), options);
+        client.connect().await.unwrap();
+
+        transport.push(session_state("running", true));
+        transport.push(assistant("hello"));
+        transport.push(json!({
+            "type": "control_request",
+            "request_id": "perm_1",
+            "request": {"subtype": "can_use_tool", "tool_name": "Write", "input": {}}
+        }));
+        transport.push(result_frame("s1"));
+
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let (result, ()) = tokio::join!(
+            async {
+                let result = client.query("write it").await;
+                done.store(true, Ordering::SeqCst);
+                result
+            },
+            async {
+                // The result alone does not end the run while the CLI reports
+                // `running`.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert!(!done.load(Ordering::SeqCst));
+                transport.push(session_state("idle", true));
+            }
+        );
+        let result = result.unwrap();
+        assert_eq!(result.session_id, "s1");
+        assert_eq!(callback.calls.load(Ordering::SeqCst), 1);
+        assert!(transport.outgoing().iter().any(|frame| {
+            frame["response"]["request_id"] == "perm_1" && frame["response"]["subtype"] == "success"
+        }));
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_without_session_state_ends_at_first_result() {
+        let transport = MockTransport::new(true);
+        let (_callback, options) = permission_options(&[]);
+        let mut client = ClaudeAgentClient::new(TransportHandle(Arc::clone(&transport)), options);
+        client.connect().await.unwrap();
+        transport.push(assistant("hi"));
+        transport.push(result_frame("s1"));
+        let result = tokio::time::timeout(Duration::from_secs(2), client.query("q"))
+            .await
+            .expect("older CLIs without state events must end at the first result")
+            .unwrap();
+        assert_eq!(result.text, "hi");
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_end_ceiling_bounds_the_wait_for_idle() {
+        let transport = MockTransport::new(true);
+        let (_callback, options) =
+            permission_options(&[("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", "50")]);
+        let mut client = ClaudeAgentClient::new(TransportHandle(Arc::clone(&transport)), options);
+        client.connect().await.unwrap();
+        transport.push(session_state("running", true));
+        transport.push(assistant("hi"));
+        transport.push(result_frame("s1"));
+        // Never goes idle: the ceiling ends the run.
+        let result = tokio::time::timeout(Duration::from_secs(5), client.query("q"))
+            .await
+            .expect("ceiling must end the run")
+            .unwrap();
+        assert_eq!(result.text, "hi");
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sdk_host_only_state_frames_are_not_surfaced() {
+        let transport = MockTransport::new(true);
+        let mut client = ClaudeAgentClient::new(
+            TransportHandle(Arc::clone(&transport)),
+            AgentOptions::default(),
+        );
+        client.connect().await.unwrap();
+        transport.push(session_state("running", true));
+        transport.push(session_state("idle", false));
+        transport.push(assistant("hi"));
+        // The marked frame is dropped; the unmarked one (caller opted in) is
+        // delivered ahead of the assistant message.
+        let first = client.receive_message().await.unwrap().unwrap();
+        assert!(!matches!(first, AgentMessage::Assistant(_)), "{first:?}");
+        let second = client.receive_message().await.unwrap().unwrap();
+        assert!(matches!(second, AgentMessage::Assistant(_)), "{second:?}");
         client.close().await.unwrap();
     }
 

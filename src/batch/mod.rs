@@ -67,7 +67,7 @@ impl<'a> BatchClient<'a> {
         }
 
         let url = format!("{}/v1/messages/batches", self.client.base_url());
-        let headers = self.client.build_headers();
+        let headers = self.client.build_attributed_headers();
 
         debug!(url = %url, "creating batch");
 

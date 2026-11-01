@@ -22,7 +22,7 @@ use serde_json::Value;
 #[cfg(test)]
 use uuid::Uuid;
 
-use super::filesystem::get_projects_dir;
+use super::filesystem::{agent_metadata_sidecar_path, get_projects_dir, split_agent_metadata};
 use super::key::{project_key_for_directory, SessionKey, SessionListSubkeysKey};
 use super::mirror::{
     MirrorErrorHandler, TranscriptMirrorBatcher, MAX_PENDING_BYTES, MAX_PENDING_ENTRIES,
@@ -739,17 +739,9 @@ async fn materialize_subkeys(
             continue;
         }
 
-        // Partition: agent_metadata entries describe the .meta.json sidecar;
-        // everything else is a transcript line.
-        let mut metadata: Vec<&SessionStoreEntry> = Vec::new();
-        let mut transcript: Vec<SessionStoreEntry> = Vec::new();
-        for e in &sub_entries {
-            if e.get("type").and_then(Value::as_str) == Some("agent_metadata") {
-                metadata.push(e);
-            } else {
-                transcript.push(e.clone());
-            }
-        }
+        // agent_metadata entries describe the .meta.json sidecar (last one
+        // wins); everything else is a transcript line.
+        let (metadata, transcript) = split_agent_metadata(sub_entries);
 
         let target = session_dir.join(&subpath);
         let sub_file = with_extra_jsonl(&target);
@@ -757,11 +749,10 @@ async fn materialize_subkeys(
             write_jsonl(&sub_file, &transcript)?;
         }
 
-        if let Some(last) = metadata.last() {
-            // Last metadata entry wins; strip the synthetic `type` field.
-            let mut meta_content = (*last).clone();
+        if let Some(mut meta_content) = metadata {
+            // Strip the synthetic `type` field.
             meta_content.remove("type");
-            let meta_file = with_meta_json(&sub_file);
+            let meta_file = agent_metadata_sidecar_path(&sub_file);
             if let Some(parent) = meta_file.parent() {
                 fs::create_dir_all(parent).map_err(|e| {
                     ClaudeError::TransportError(format!("resume: mkdir {}: {e}", parent.display()))
@@ -786,16 +777,6 @@ fn with_extra_jsonl(target: &Path) -> PathBuf {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     target.with_file_name(format!("{name}.jsonl"))
-}
-
-/// `<x>.jsonl` → `<x>.meta.json`.
-fn with_meta_json(sub_file: &Path) -> PathBuf {
-    let name = sub_file
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let stem = name.strip_suffix(".jsonl").unwrap_or(&name);
-    sub_file.with_file_name(format!("{stem}.meta.json"))
 }
 
 /// Reject subpaths that are empty, absolute, contain `..`, or escape

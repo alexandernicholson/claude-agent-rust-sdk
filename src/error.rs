@@ -34,6 +34,7 @@ use thiserror::Error;
 /// [`CliConnection`](ClaudeError::CliConnection),
 /// [`CliNotFound`](ClaudeError::CliNotFound),
 /// [`Process`](ClaudeError::Process),
+/// [`ResultError`](ClaudeError::ResultError),
 /// [`CliJsonDecode`](ClaudeError::CliJsonDecode),
 /// [`MessageParse`](ClaudeError::MessageParse), and
 /// [`ControlTimeout`](ClaudeError::ControlTimeout).
@@ -46,6 +47,7 @@ use thiserror::Error;
 /// | [`CliConnection`](ClaudeError::CliConnection) | `CLIConnectionError`   |
 /// | [`CliNotFound`](ClaudeError::CliNotFound)     | `CLINotFoundError`     |
 /// | [`Process`](ClaudeError::Process)             | `ProcessError`         |
+/// | [`ResultError`](ClaudeError::ResultError)     | `ResultError`          |
 /// | [`CliJsonDecode`](ClaudeError::CliJsonDecode) | `CLIJSONDecodeError`   |
 /// | [`MessageParse`](ClaudeError::MessageParse)   | `MessageParseError`    |
 #[derive(Debug, Error)]
@@ -132,6 +134,20 @@ pub enum ClaudeError {
         stderr: Option<String>,
     },
 
+    /// The CLI exited after reporting a terminal error `result`.
+    ///
+    /// Mirrors Python `ResultError`, a subclass of `ProcessError`: the CLI ends
+    /// a failed run by emitting a `result` frame with `is_error: true` (also
+    /// delivered as an [`AgentMessage::Result`](crate::agent::AgentMessage))
+    /// and then exiting non-zero. The SDK surfaces this variant instead of the
+    /// bare "exit code N" [`Process`](ClaudeError::Process) error so callers
+    /// can branch on [`ResultErrorDetails::terminal_reason`] /
+    /// [`ResultErrorDetails::subtype`] without string matching. Use
+    /// [`ClaudeError::is_process`] and [`ClaudeError::exit_code`] to treat it
+    /// like a process error.
+    #[error("{0}")]
+    ResultError(Box<ResultErrorDetails>),
+
     /// Unable to decode a JSON line emitted by the CLI.
     ///
     /// Mirrors Python `CLIJSONDecodeError`, retaining the raw `line` and the
@@ -208,6 +224,37 @@ impl ClaudeError {
         }
     }
 
+    /// Construct a [`ResultError`](ClaudeError::ResultError) from a raw
+    /// `result` frame with `is_error: true`, mirroring Python
+    /// `ResultError(message, data, exit_code)`.
+    #[must_use]
+    pub fn result_error(data: &serde_json::Value, exit_code: Option<i32>) -> Self {
+        Self::ResultError(Box::new(ResultErrorDetails::from_result_frame(
+            data, exit_code,
+        )))
+    }
+
+    /// Whether this error is a CLI process failure, treating
+    /// [`ResultError`](ClaudeError::ResultError) as a subtype.
+    ///
+    /// Mirrors the Python hierarchy where `ResultError` subclasses
+    /// `ProcessError`, so `except ProcessError` also catches it.
+    #[must_use]
+    pub const fn is_process(&self) -> bool {
+        matches!(self, Self::Process { .. } | Self::ResultError(_))
+    }
+
+    /// The CLI exit code carried by a [`Process`](ClaudeError::Process) or
+    /// [`ResultError`](ClaudeError::ResultError) error.
+    #[must_use]
+    pub fn exit_code(&self) -> Option<i32> {
+        match self {
+            Self::Process { exit_code, .. } => *exit_code,
+            Self::ResultError(details) => details.exit_code,
+            _ => None,
+        }
+    }
+
     /// Whether this error is a CLI connection failure, treating
     /// [`CliNotFound`](ClaudeError::CliNotFound) as a subtype.
     ///
@@ -217,6 +264,112 @@ impl ClaudeError {
     #[must_use]
     pub const fn is_cli_connection(&self) -> bool {
         matches!(self, Self::CliConnection(_) | Self::CliNotFound(_))
+    }
+}
+
+/// Payload of [`ClaudeError::ResultError`]: the terminal error `result` frame
+/// the CLI reported before exiting non-zero.
+///
+/// Boxed inside the error enum to keep [`ClaudeError`] small.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResultErrorDetails {
+    /// `"Claude Code returned an error result: <text>"`, where `<text>` is the
+    /// most informative of `errors`, `result`, a non-`success` `subtype`, or
+    /// the HTTP status.
+    pub message: String,
+    /// CLI process exit code, when known.
+    pub exit_code: Option<i32>,
+    /// Result subtype (`error_max_turns`, `error_during_execution`, ... or
+    /// `success` when the loop completed but the last turn was an API error).
+    pub subtype: Option<String>,
+    /// Error strings reported by the CLI, trimmed with blank and non-string
+    /// entries dropped (a bare string is accepted as a one-element list).
+    pub errors: Vec<String>,
+    /// Result text, if any. For API failures this holds the `API Error: ...`
+    /// prose.
+    pub result: Option<String>,
+    /// HTTP status of the failing API call, if any.
+    pub api_error_status: Option<u16>,
+    /// Why the run ended (e.g. `api_error`, `max_turns`), if reported.
+    pub terminal_reason: Option<String>,
+    /// Session the result belongs to, if reported.
+    pub session_id: Option<String>,
+    /// The raw `result` frame as emitted by the CLI.
+    pub data: serde_json::Value,
+}
+
+impl ResultErrorDetails {
+    /// Build the details from a raw `result` frame (`is_error: true`) and the
+    /// CLI exit code, normalizing fields like Python `ResultError`.
+    #[must_use]
+    pub fn from_result_frame(data: &serde_json::Value, exit_code: Option<i32>) -> Self {
+        let text_field = |key: &str| data.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+        let errors = normalize_result_errors(data.get("errors"));
+        let result = text_field("result");
+        let subtype = text_field("subtype");
+        let api_error_status = data
+            .get("api_error_status")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|status| u16::try_from(status).ok());
+        let text = if !errors.is_empty() {
+            errors.join("; ")
+        } else if let Some(text) = result.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            text.to_owned()
+        } else if let Some(kind) = subtype
+            .as_deref()
+            .filter(|t| !t.is_empty() && *t != "success")
+        {
+            kind.to_owned()
+        } else if let Some(status) = data.get("api_error_status").filter(|v| !v.is_null()) {
+            format!("API error (HTTP {status})")
+        } else {
+            "unknown error".to_owned()
+        };
+        Self {
+            message: format!("Claude Code returned an error result: {text}"),
+            exit_code,
+            subtype,
+            errors,
+            result,
+            api_error_status,
+            terminal_reason: text_field("terminal_reason"),
+            session_id: text_field("session_id"),
+            data: data.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for ResultErrorDetails {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)?;
+        if let Some(code) = self.exit_code {
+            write!(f, " (exit code: {code})")?;
+        }
+        Ok(())
+    }
+}
+
+/// Normalize a `result` frame's `errors` to clean strings (Python
+/// `_normalize_result_errors`): accept a bare string, drop non-string and
+/// blank entries, trim the rest.
+fn normalize_result_errors(raw: Option<&serde_json::Value>) -> Vec<String> {
+    match raw {
+        Some(serde_json::Value::String(text)) => {
+            let text = text.trim();
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![text.to_owned()]
+            }
+        }
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -521,5 +674,57 @@ mod tests {
             // Debug is available for all.
             assert!(!format!("{err:?}").is_empty());
         }
+    }
+
+    #[test]
+    fn result_error_normalizes_frame_and_counts_as_process() {
+        let frame = json!({
+            "type": "result",
+            "is_error": true,
+            "subtype": "error_max_turns",
+            "errors": ["  first ", "", 7, "second"],
+            "terminal_reason": "max_turns",
+            "api_error_status": 529,
+            "session_id": "s1",
+        });
+        let err = ClaudeError::result_error(&frame, Some(1));
+        assert!(err.is_process());
+        assert_eq!(err.exit_code(), Some(1));
+        assert_eq!(
+            err.to_string(),
+            "Claude Code returned an error result: first; second (exit code: 1)"
+        );
+        let ClaudeError::ResultError(details) = err else {
+            panic!("expected ResultError");
+        };
+        assert_eq!(details.errors, ["first", "second"]);
+        assert_eq!(details.subtype.as_deref(), Some("error_max_turns"));
+        assert_eq!(details.terminal_reason.as_deref(), Some("max_turns"));
+        assert_eq!(details.api_error_status, Some(529));
+        assert_eq!(details.session_id.as_deref(), Some("s1"));
+        assert_eq!(details.data, frame);
+    }
+
+    #[test]
+    fn result_error_text_falls_back_to_result_then_subtype_then_status() {
+        let api = json!({"subtype": "success", "result": " API Error: overloaded ", "errors": []});
+        assert!(ClaudeError::result_error(&api, None)
+            .to_string()
+            .ends_with(": API Error: overloaded"));
+        let bare = json!({"subtype": "error_during_execution"});
+        assert!(ClaudeError::result_error(&bare, None)
+            .to_string()
+            .ends_with(": error_during_execution"));
+        let status = json!({"subtype": "success", "api_error_status": 500});
+        assert!(ClaudeError::result_error(&status, None)
+            .to_string()
+            .ends_with(": API error (HTTP 500)"));
+        let string_errors = json!({"errors": "boom"});
+        let ClaudeError::ResultError(details) = ClaudeError::result_error(&string_errors, None)
+        else {
+            panic!("expected ResultError");
+        };
+        assert_eq!(details.errors, ["boom"]);
+        assert!(!ClaudeError::process("p", None, None).to_string().is_empty());
     }
 }

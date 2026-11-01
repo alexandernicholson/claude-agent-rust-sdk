@@ -62,9 +62,10 @@
 //! ```ignore
 //! let response = client
 //!     .messages()
-//!     .model(models::CLAUDE_SONNET_4_6)
+//!     .model(models::CLAUDE_OPUS_5_5)
 //!     .max_tokens(16000)
-//!     .thinking(10000)
+//!     .thinking_adaptive(None) // the model decides how much to think
+//!     .effort(EffortLevel::High)
 //!     .user("Solve this complex problem...")
 //!     .send()
 //!     .await?;
@@ -156,26 +157,32 @@ pub mod streaming;
 pub mod transport;
 pub mod types;
 
-pub use error::ClaudeError;
+pub use error::{ClaudeError, ResultErrorDetails};
 pub use extensions::{
-    AgentDefinition, AgentEffort, AgentMemory, BaseHookInput, CanUseTool,
-    CanUseToolShadowedWarning, ContextUsageCategory, ContextUsageResponse, HookCallback,
-    HookContext, HookEvent, HookHandler, HookInput, HookInputKind, HookJSONOutput, HookMatcher,
+    AgentDefinition, AgentEffort, AgentMemory, BackgroundTaskSummary, BaseHookInput, CanUseTool,
+    CanUseToolShadowedWarning, ContextUsageCategory, ContextUsageResponse,
+    CwdChangedHookSpecificOutput, ElicitationHookSpecificOutput,
+    ElicitationResultHookSpecificOutput, FileChangedHookSpecificOutput, HookCallback, HookContext,
+    HookEffort, HookEvent, HookHandler, HookInput, HookInputKind, HookJSONOutput, HookMatcher,
     McpClaudeAiProxyServerConfig, McpHttpServerConfig, McpSdkServerConfig,
     McpSdkServerConfigStatus, McpServerConfig, McpServerConnectionStatus, McpServerInfo,
     McpServerStatus, McpServerStatusConfig, McpSseServerConfig, McpStatusResponse,
-    McpStdioServerConfig, McpToolAnnotations, McpToolInfo, ModelUsage, NotificationHookInput,
-    NotificationHookSpecificOutput, OutputFormat, PermissionBehavior, PermissionMode,
+    McpStdioServerConfig, McpToolAnnotations, McpToolInfo, MessageDisplayHookSpecificOutput,
+    ModelUsage, NotificationHookInput, NotificationHookSpecificOutput, OutputFormat,
+    PermissionBehavior, PermissionDeniedHookSpecificOutput, PermissionMode,
     PermissionRequestHookInput, PermissionRequestHookSpecificOutput, PermissionResult,
     PermissionRuleValue, PermissionUpdate, PermissionUpdateDestination, PermissionUpdateType,
+    PostModelSwitchHookSpecificOutput, PostToolBatchHookSpecificOutput,
     PostToolUseFailureHookInput, PostToolUseFailureHookSpecificOutput, PostToolUseHookInput,
-    PostToolUseHookSpecificOutput, PreCompactHookInput, PreCompactTrigger, PreToolUseHookInput,
-    PreToolUseHookSpecificOutput, SandboxIgnoreViolations, SandboxNetworkConfig, SandboxSettings,
-    SdkBeta, SdkPluginConfig, SdkPluginKind, SessionStartHookSpecificOutput, SettingSource,
-    SkillSelection, StopHookInput, SubagentStartHookInput, SubagentStartHookSpecificOutput,
-    SubagentStopHookInput, SyncHookJSONOutput, SystemPrompt, TaskBudget, TaskUsage,
-    ThinkingConfig as AgentThinkingConfig, ThinkingDisplay, ToolPermissionCallback,
-    ToolPermissionContext, ToolsSpec, UserPromptSubmitHookInput,
-    UserPromptSubmitHookSpecificOutput,
+    PostToolUseHookSpecificOutput, PreCompactHookInput, PreCompactTrigger,
+    PreModelSwitchHookSpecificOutput, PreToolUseHookInput, PreToolUseHookSpecificOutput,
+    SandboxIgnoreViolations, SandboxNetworkConfig, SandboxSettings, SdkBeta, SdkPluginConfig,
+    SdkPluginKind, SessionCronSummary, SessionStartHookSpecificOutput, SettingSource,
+    SkillSelection, StopHookInput, StopHookSpecificOutput, SubagentStartHookInput,
+    SubagentStartHookSpecificOutput, SubagentStopHookInput, SubagentStopHookSpecificOutput,
+    SyncHookJSONOutput, SystemPrompt, TaskBudget, TaskUsage, ThinkingConfig as AgentThinkingConfig,
+    ThinkingDisplay, ToolPermissionCallback, ToolPermissionContext, ToolsSpec,
+    UserPromptExpansionHookSpecificOutput, UserPromptSubmitHookInput,
+    UserPromptSubmitHookSpecificOutput, WorktreeCreateHookSpecificOutput,
 };
 pub use types::EffortLevel;

@@ -47,6 +47,7 @@ All HTTP communication flows through a single `ClaudeClient` instance. User code
 - The base URL (`https://api.anthropic.com`).
 - An authentication credential (API key or OAuth token).
 - A list of beta feature flags.
+- Optional workspace and user-profile IDs.
 
 ```
 ClaudeClient
@@ -54,14 +55,17 @@ ClaudeClient
   base_url: String
   auth: AuthMethod
   beta_features: Vec<String>
+  workspace_id: Option<HeaderValue>
+  user_profile_id: Option<HeaderValue>
 ```
 
 Every outgoing request passes through `build_headers()` which:
 
 1. Sets `Content-Type: application/json`.
-2. Sets `anthropic-version: 2023-06-01`.
+2. Sets `anthropic-version: 2026-10-21`.
 3. Injects the authentication header based on `AuthMethod`.
 4. If beta features are configured, sets `anthropic-beta` as a comma-separated value.
+5. If a workspace ID is configured, sets `anthropic-workspace-id`; if a user profile ID is configured, sets `anthropic-user-profile-id` (create_message, streaming, count_tokens, batch create).
 
 ### Core Methods
 
@@ -106,10 +110,11 @@ Request-side `ContentBlock` is a tagged enum:
 ```
 ContentBlock
   Text { text, cache_control }
-  Image { source: ImageSource, cache_control }
+  Image { source: ImageSource, cache_control, transformations }
   Document { source: DocumentSource, cache_control, citations, context, title }
-  ToolUse { id, name, input }
-  ToolResult { tool_use_id, content, is_error, cache_control }
+  ToolUse { id, name, input, toolset_name }
+  ToolResult { tool_use_id, content, is_error, cache_control, toolset_name }
+  BrowserState { tabs, state_changes, cache_control }
   Thinking { thinking, signature }
   RedactedThinking { data }
 ```
@@ -119,10 +124,12 @@ Response-side `ResponseContentBlock`:
 ```
 ResponseContentBlock
   Text { text, citations }
-  ToolUse { id, name, input }
+  ToolUse { id, name, input, toolset_name }
   Thinking { thinking, signature }
   RedactedThinking { data }
 ```
+
+`CreateMessageResponse` additionally carries `stop_details` (refusal category and explanation) and `diagnostics` (`cache_miss_reason`). `Role` includes `System` for mid-conversation system messages (text content only).
 
 ### Image and Document Sources
 
@@ -136,6 +143,7 @@ DocumentSource
   Base64 { media_type, data }
   Text { media_type, data }
   Url { url }
+  File { file_id }
   Content { content }
 ```
 
@@ -144,8 +152,11 @@ DocumentSource
 ```
 ToolDefinition (untagged)
   Custom(Tool)          -- user-defined tools with input_schema
-  Server(ServerTool)    -- server-side tools (web search, code exec, etc.)
+  Server(ServerTool)    -- server-side tools (web fetch/search, code execution, etc.), built via ServerTool::new(type, name)
+  Toolset(Toolset)      -- computer / browser toolsets (computer_toolset_20260801, browser_toolset_20260801)
 ```
+
+`ServerTool` also carries `url_sources` (`WebFetchUrlSources`, each source a `UrlSource`: `All`, `None`, `Only { tools }`, or `Except { tools }`), `response_inclusion`, and `use_cache`.
 
 ### Citation Types
 
@@ -183,7 +194,7 @@ message_start
   content_block_start (index 1)
     ...
   content_block_stop (index 1)
-message_delta (stop_reason, usage)
+message_delta (stop_reason, stop_details, usage)
 message_stop
 ```
 
@@ -211,10 +222,13 @@ If the API returns an `error` event, it is yielded as `StreamEvent::Error`. The 
 
 ```
 ThinkingConfig (tagged by type)
-  Enabled { budget_tokens: u32 }    -- manual thinking with fixed budget
-  Disabled {}                       -- no thinking (default)
-  Adaptive { budget_tokens: Option } -- model decides (recommended for Opus 4.6)
+  Enabled { budget_tokens: u32, display: Option }  -- manual thinking with fixed budget (deprecated on Opus 4.6 / Sonnet 4.6, rejected by later models)
+  Disabled {}                                      -- thinking off (some models reject it; the default when omitted depends on the model)
+  BetweenTools {}                                  -- thinking between tool calls
+  Adaptive { budget_tokens: Option, display: Option } -- model decides (recommended)
 ```
+
+`display` is `"summarized"` or `"omitted"`. `Usage.output_tokens_details.thinking_tokens` reports thinking token usage.
 
 ### Response
 
@@ -246,13 +260,13 @@ Key builder methods by category:
 | Category | Methods |
 |----------|---------|
 | Required | `model()`, `max_tokens()`, `user()` |
-| Messages | `user()`, `user_blocks()`, `assistant()`, `assistant_blocks()`, `message()` |
+| Messages | `user()`, `user_blocks()`, `assistant()`, `assistant_blocks()`, `system_message()`, `message()` |
 | System | `system()`, `system_with_cache()` |
-| Sampling | `temperature()`, `top_p()`, `top_k()`, `stop_sequences()` |
-| Tools | `tool()`, `tools()`, `custom_tools()`, `tool_choice()` |
-| Thinking | `thinking()`, `thinking_adaptive()`, `thinking_config()` |
-| Output | `effort()`, `json_schema()` |
-| Other | `stream()`, `cache_control()`, `metadata()`, `service_tier()` |
+| Stopping | `stop_sequences()` |
+| Tools | `tool()`, `tools()`, `custom_tools()`, `server_tool()`, `toolset()`, `tool_choice()` |
+| Thinking | `thinking()` (deprecated), `thinking_adaptive()`, `thinking_between_tools()`, `thinking_config()` |
+| Output | `effort()` (low, medium, high, xhigh, max), `json_schema()` |
+| Other | `stream()`, `cache_control()`, `metadata()`, `service_tier()`, `speed()`, `diagnostics()` |
 | Send | `build()`, `send()`, `send_stream()` |
 
 `EffortLevel` accepts `Low`, `Medium`, `High`, `XHigh`, and `Max`. Effort is a
@@ -341,7 +355,7 @@ The `count_tokens` endpoint allows pre-flight token counting:
 ```
 POST /v1/messages/count_tokens
 
-CountTokensRequest { model, messages, system, tools, thinking, tool_choice }
+CountTokensRequest { model, messages, system, tools, thinking, tool_choice, speed }
 CountTokensResponse { input_tokens }
 ```
 

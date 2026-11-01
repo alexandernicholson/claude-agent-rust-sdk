@@ -13,11 +13,13 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::error::ClaudeError;
-use crate::sessions::filesystem::{resolve_session_file_path, validate_uuid};
+use crate::sessions::filesystem::{
+    read_agent_metadata_sidecar, resolve_session_file_path, validate_uuid,
+};
 use crate::sessions::mirror::{MAX_PENDING_BYTES, MAX_PENDING_ENTRIES};
 use crate::sessions::store::{SessionStore, SessionStoreEntry};
 use crate::sessions::SessionKey;
@@ -37,7 +39,7 @@ use crate::sessions::SessionKey;
 /// * [`ClaudeError::InvalidConfig`] if `session_id` is not a valid UUID.
 /// * [`ClaudeError::TransportError`] if the session JSONL cannot be found or a
 ///   file read fails.
-/// * [`ClaudeError::SerializationError`] for malformed JSONL lines / sidecars.
+/// * [`ClaudeError::SerializationError`] for malformed JSONL lines.
 /// * Adapter errors propagate from `append`.
 pub async fn import_session_to_store(
     session_id: &str,
@@ -95,36 +97,16 @@ pub async fn import_session_to_store(
 
         // The on-disk .jsonl does NOT contain agent_metadata entries — those
         // live only in the .meta.json sidecar. Import it so resume can recreate
-        // it and resumed subagents keep their agentType/worktreePath.
-        let meta_path = meta_sidecar_path(&file_path);
-        match std::fs::read_to_string(&meta_path) {
-            Ok(text) => {
-                let meta: Value = serde_json::from_str(&text)?;
-                let mut meta_entry: SessionStoreEntry = Map::new();
-                meta_entry.insert("type".into(), Value::String("agent_metadata".into()));
-                // Upstream does `meta_entry.update(meta)`, which raises for a
-                // non-object sidecar. Route the same failure rather than
-                // silently importing a bare `{"type":"agent_metadata"}`.
-                match meta {
-                    Value::Object(fields) => {
-                        for (k, v) in fields {
-                            meta_entry.insert(k, v);
-                        }
-                    }
-                    other => {
-                        return Err(ClaudeError::MessageParse {
-                            message: format!(
-                                "agent metadata sidecar {} is not a JSON object",
-                                meta_path.display()
-                            ),
-                            data: Some(other),
-                        });
-                    }
-                }
-                store.append(&sub_key, vec![meta_entry]).await?;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(ClaudeError::TransportError(e.to_string())),
+        // it and resumed subagents keep their agentType/worktreePath. A missing,
+        // corrupt, or non-object sidecar is treated as absent (the transcript
+        // is still imported); other read errors propagate.
+        let meta = read_agent_metadata_sidecar(&file_path)
+            .map_err(|e| ClaudeError::TransportError(e.to_string()))?;
+        if let Some(mut meta_entry) = meta {
+            // Synthetic discriminator last so a stray "type" key in the
+            // CLI-owned sidecar can never shadow it.
+            meta_entry.insert("type".into(), Value::String("agent_metadata".into()));
+            store.append(&sub_key, vec![meta_entry]).await?;
         }
     }
 
@@ -215,16 +197,6 @@ fn relative_subpath(session_dir: &Path, file_path: &Path) -> Option<String> {
         *last = stripped.to_string();
     }
     Some(parts.join("/"))
-}
-
-/// `<name>.jsonl` -> `<name>.meta.json` alongside the transcript.
-fn meta_sidecar_path(file_path: &Path) -> PathBuf {
-    let name = file_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default();
-    let base = name.strip_suffix(".jsonl").unwrap_or(name);
-    file_path.with_file_name(format!("{base}.meta.json"))
 }
 
 // ===========================================================================
@@ -328,7 +300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn import_scalar_sidecar_fails_visibly() {
+    async fn import_unusable_sidecar_is_treated_as_absent() {
         let _guard = env_lock().await;
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
@@ -336,7 +308,46 @@ mod tests {
         let project_dir = project_dir_for(cwd);
         let subagents = project_dir.join(SID).join("subagents");
         std::fs::create_dir_all(&subagents).unwrap();
-        // Valid main transcript + subagent transcript.
+        write_lines(
+            &project_dir.join(format!("{SID}.jsonl")),
+            &[json!({"type":"user","uuid":"u0"})],
+        );
+        // Scalar and corrupt sidecars: the transcripts are still imported and
+        // no agent_metadata entry is appended.
+        for (agent, sidecar) in [("abc", "42"), ("def", "{not json")] {
+            write_lines(
+                &subagents.join(format!("agent-{agent}.jsonl")),
+                &[json!({"type":"assistant","uuid":format!("a-{agent}")})],
+            );
+            std::fs::write(subagents.join(format!("agent-{agent}.meta.json")), sidecar).unwrap();
+        }
+        let store = InMemorySessionStore::new();
+        import_session_to_store(SID, &store, Some(cwd), true, 0)
+            .await
+            .unwrap();
+        let pk = project_key_for_directory(Some(Path::new(&canonical(cwd))));
+        for agent in ["abc", "def"] {
+            let key = SessionKey::with_subpath(pk.clone(), SID, format!("subagents/agent-{agent}"))
+                .unwrap();
+            let entries = store.get_entries(&key);
+            assert_eq!(entries.len(), 1, "{agent}: transcript only, no metadata");
+            assert_ne!(
+                entries[0].get("type").and_then(Value::as_str),
+                Some("agent_metadata")
+            );
+        }
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+    }
+
+    #[tokio::test]
+    async fn import_sidecar_type_key_cannot_shadow_discriminator() {
+        let _guard = env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
+        let cwd = "/tmp/import-shadow-sidecar";
+        let project_dir = project_dir_for(cwd);
+        let subagents = project_dir.join(SID).join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
         write_lines(
             &project_dir.join(format!("{SID}.jsonl")),
             &[json!({"type":"user","uuid":"u0"})],
@@ -345,17 +356,30 @@ mod tests {
             &subagents.join("agent-abc.jsonl"),
             &[json!({"type":"assistant","uuid":"a0"})],
         );
-        // Scalar sidecar: upstream's `meta_entry.update(meta)` raises for a
-        // non-object; we route the same failure instead of importing a bare
-        // `{"type":"agent_metadata"}`.
-        std::fs::write(subagents.join("agent-abc.meta.json"), "42").unwrap();
+        std::fs::write(
+            subagents.join("agent-abc.meta.json"),
+            r#"{"type":"user","toolUseId":"toolu_1"}"#,
+        )
+        .unwrap();
         let store = InMemorySessionStore::new();
-        let err = import_session_to_store(SID, &store, Some(cwd), true, 0)
+        import_session_to_store(SID, &store, Some(cwd), true, 0)
             .await
-            .unwrap_err();
-        assert!(
-            matches!(err, ClaudeError::MessageParse { .. }),
-            "scalar sidecar must route to MessageParse, got {err:?}"
+            .unwrap();
+        let key = SessionKey::with_subpath(
+            project_key_for_directory(Some(Path::new(&canonical(cwd)))),
+            SID,
+            "subagents/agent-abc".to_string(),
+        )
+        .unwrap();
+        let entries = store.get_entries(&key);
+        let meta = entries.last().expect("metadata entry");
+        assert_eq!(
+            meta.get("type").and_then(Value::as_str),
+            Some("agent_metadata")
+        );
+        assert_eq!(
+            meta.get("toolUseId").and_then(Value::as_str),
+            Some("toolu_1")
         );
         std::env::remove_var("CLAUDE_CONFIG_DIR");
     }
@@ -467,11 +491,5 @@ mod tests {
             relative_subpath(session_dir, file).as_deref(),
             Some("subagents/workflows/run-1/agent-x")
         );
-    }
-
-    #[test]
-    fn meta_sidecar_path_derivation() {
-        let file = Path::new("/a/agent-x.jsonl");
-        assert_eq!(meta_sidecar_path(file), Path::new("/a/agent-x.meta.json"));
     }
 }

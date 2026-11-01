@@ -10,11 +10,16 @@ use std::str::FromStr;
 // ---------------------------------------------------------------------------
 
 /// The role of a message participant.
+///
+/// [`Role::System`] marks a mid-conversation system message inside
+/// `messages`; its content must be text. The initial system prompt still goes
+/// in the top-level `system` parameter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     User,
     Assistant,
+    System,
 }
 
 // ---------------------------------------------------------------------------
@@ -79,6 +84,17 @@ pub enum ImageSource {
     File { file_id: String },
 }
 
+/// Transformations the server applies to an image before the model observes
+/// it. Omitted fields keep their default behavior.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImageTransformations {
+    /// What to do when the image exceeds the model's maximum image size:
+    /// `"downsize"` (default) scales it down to fit; `"error"` rejects the
+    /// request with a 400 error naming the image's dimensions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oversized_image: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // DocumentSource
 // ---------------------------------------------------------------------------
@@ -95,6 +111,8 @@ pub enum DocumentSource {
     Url { url: String },
     /// Content block array.
     Content { content: DocumentContentData },
+    /// A file uploaded via the Files API.
+    File { file_id: String },
 }
 
 /// The content field inside a `DocumentSource::Content` variant.
@@ -136,6 +154,9 @@ pub enum ContentBlock {
         source: ImageSource,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
+        /// Server-side transformations applied before the model sees the image.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        transformations: Option<ImageTransformations>,
     },
     /// A document (PDF, plain text, URL, or content blocks).
     Document {
@@ -154,6 +175,9 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: serde_json::Value,
+        /// For a toolset member call, the toolset family it belongs to.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        toolset_name: Option<String>,
     },
     /// The result of running a tool, sent back to the model.
     ToolResult {
@@ -163,12 +187,70 @@ pub enum ContentBlock {
         is_error: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
+        /// For a toolset member result, the `toolset_name` of the paired
+        /// `tool_use`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        toolset_name: Option<String>,
     },
     /// A thinking block from extended thinking (passed back in multi-turn).
     Thinking { thinking: String, signature: String },
     /// A redacted thinking block (opaque, passed back in multi-turn).
     #[serde(rename = "redacted_thinking")]
     RedactedThinking { data: String },
+    /// The caller's browser state after a browser toolset member call. Send
+    /// at most one, inside the `tool_result` that answers that call.
+    BrowserState {
+        /// Every tab open after the call (the full inventory, not a delta).
+        tabs: Vec<BrowserTab>,
+        /// Tabs opened and download state changes during the call. Omit
+        /// when there is nothing to report.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        state_changes: Option<Vec<BrowserStateChange>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
+}
+
+/// One open tab in a [`ContentBlock::BrowserState`] inventory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserTab {
+    /// Caller-assigned identifier, unique within the inventory.
+    pub tab_id: String,
+    /// Page title. May be empty.
+    pub title: String,
+    /// Page URL. May be empty.
+    pub url: String,
+    /// Whether this is the active tab. Exactly one entry is active whenever
+    /// the inventory is non-empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
+}
+
+/// A side effect of a browser toolset member call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BrowserStateChange {
+    /// A tab the call opened that is still open; its entry is in `tabs`.
+    TabOpened { tab_id: String },
+    /// A download that started during the call.
+    DownloadStarted { download_id: String, url: String },
+    /// A download that finished during the call.
+    DownloadCompleted {
+        download_id: String,
+        url: String,
+        /// Where the file was saved, when another tool can read it there.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        size_bytes: Option<u64>,
+    },
+    /// A download that failed or was cancelled during the call.
+    DownloadFailed {
+        download_id: String,
+        url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 /// The content of a tool result -- either a plain string or an array of blocks.
@@ -261,6 +343,9 @@ pub struct CitationsConfig {
 /// let tool = ServerTool::web_fetch()
 ///     .with_max_uses(1)
 ///     .with_max_content_tokens(5000);
+///
+/// // Any other tool type or version:
+/// let code = ServerTool::new("code_execution_20260521", "code_execution");
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerTool {
@@ -291,9 +376,26 @@ pub struct ServerTool {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub citations: Option<CitationsConfig>,
 
-    /// List of allowed callers (tool names that can invoke this tool).
+    /// List of allowed callers (`"direct"` or a code execution tool type such
+    /// as `"code_execution_20260521"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_callers: Option<Vec<String>>,
+
+    /// Which sources contribute the URLs `web_fetch` may fetch. Omitted means
+    /// every source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url_sources: Option<WebFetchUrlSources>,
+
+    /// How results consumed by a completed `code_execution` call appear in
+    /// the response: `"full"` (default) or `"excluded"`. Supported by
+    /// `web_search_20260318` and `web_fetch_20260318`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_inclusion: Option<String>,
+
+    /// Set to `false` to bypass cached content (`web_fetch_20260309` and
+    /// later).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_cache: Option<bool>,
 
     /// Additional tool-specific configuration (flattened into the JSON).
     #[serde(flatten)]
@@ -301,40 +403,44 @@ pub struct ServerTool {
 }
 
 impl ServerTool {
-    /// Create a `web_fetch` server tool with default configuration.
+    /// Create a server tool of any `type` and `name`, e.g.
+    /// `ServerTool::new("web_fetch_20260318", "web_fetch")`.
+    #[must_use]
+    pub fn new(tool_type: &str, name: &str) -> Self {
+        Self {
+            tool_type: tool_type.to_string(),
+            name: name.to_string(),
+            max_uses: None,
+            max_content_tokens: None,
+            allowed_domains: None,
+            blocked_domains: None,
+            citations: None,
+            allowed_callers: None,
+            url_sources: None,
+            response_inclusion: None,
+            use_cache: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    /// Create a `web_fetch` server tool (`web_fetch_20250910`) with default
+    /// configuration. Use [`ServerTool::new`] for later versions such as
+    /// `web_fetch_20260318`.
     ///
     /// The `web_fetch` tool allows Claude to fetch the content of URLs
     /// that appear in the conversation. It executes server-side and
     /// does not require the client to handle tool results.
     #[must_use]
     pub fn web_fetch() -> Self {
-        Self {
-            tool_type: "web_fetch_20250910".to_string(),
-            name: "web_fetch".to_string(),
-            max_uses: None,
-            max_content_tokens: None,
-            allowed_domains: None,
-            blocked_domains: None,
-            citations: None,
-            allowed_callers: None,
-            extra: serde_json::Map::new(),
-        }
+        Self::new("web_fetch_20250910", "web_fetch")
     }
 
-    /// Create a `web_search` server tool with default configuration.
+    /// Create a `web_search` server tool (`web_search_20250305`) with default
+    /// configuration. Use [`ServerTool::new`] for later versions such as
+    /// `web_search_20260318`.
     #[must_use]
     pub fn web_search() -> Self {
-        Self {
-            tool_type: "web_search_20250305".to_string(),
-            name: "web_search".to_string(),
-            max_uses: None,
-            max_content_tokens: None,
-            allowed_domains: None,
-            blocked_domains: None,
-            citations: None,
-            allowed_callers: None,
-            extra: serde_json::Map::new(),
-        }
+        Self::new("web_search_20250305", "web_search")
     }
 
     /// Set the maximum number of times the tool can be used per request.
@@ -381,9 +487,175 @@ impl ServerTool {
         self.allowed_callers = Some(callers);
         self
     }
+
+    /// Restrict which sources contribute the URLs `web_fetch` may fetch.
+    #[must_use]
+    pub fn with_url_sources(mut self, sources: WebFetchUrlSources) -> Self {
+        self.url_sources = Some(sources);
+        self
+    }
+
+    /// Set how results consumed by a completed `code_execution` call appear
+    /// in the response (`"full"` or `"excluded"`).
+    #[must_use]
+    pub fn with_response_inclusion(mut self, inclusion: &str) -> Self {
+        self.response_inclusion = Some(inclusion.to_string());
+        self
+    }
+
+    /// Set whether `web_fetch` may serve cached content.
+    #[must_use]
+    pub fn with_use_cache(mut self, use_cache: bool) -> Self {
+        self.use_cache = Some(use_cache);
+        self
+    }
 }
 
-/// A tool definition that can be either a custom tool or a server tool.
+/// Which sources contribute the URLs `web_fetch` may fetch.
+///
+/// Omitted fields contribute everything. A tool named in an `only` or
+/// `except` filter must be declared in the request's `tools`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WebFetchUrlSources {
+    /// Whether URLs in user messages are fetchable ([`UrlSource::All`] or
+    /// [`UrlSource::None`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_input: Option<UrlSource>,
+
+    /// Which client tools' results contribute fetchable URLs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_tool_results: Option<UrlSource>,
+
+    /// Which server tools' results contribute fetchable URLs. Only
+    /// `web_search` and `web_fetch` results ever contribute.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_tool_results: Option<UrlSource>,
+}
+
+/// One source filter inside [`WebFetchUrlSources`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UrlSource {
+    /// The source contributes in full.
+    All {},
+    /// The source contributes nothing.
+    None {},
+    /// Only the named tools' results contribute (tool filters only).
+    Only { tools: Vec<UrlSourceTool> },
+    /// Every result except the named tools' contributes (tool filters only).
+    Except { tools: Vec<UrlSourceTool> },
+}
+
+impl UrlSource {
+    /// Only results from the named tools contribute.
+    #[must_use]
+    pub fn only(tool_names: &[&str]) -> Self {
+        Self::Only {
+            tools: UrlSourceTool::references(tool_names),
+        }
+    }
+
+    /// Every result except the named tools' contributes.
+    #[must_use]
+    pub fn except(tool_names: &[&str]) -> Self {
+        Self::Except {
+            tools: UrlSourceTool::references(tool_names),
+        }
+    }
+}
+
+/// A tool named in a [`UrlSource::Only`] or [`UrlSource::Except`] filter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UrlSourceTool {
+    /// Names a tool declared in the request's `tools`.
+    ToolReference { name: String },
+}
+
+impl UrlSourceTool {
+    fn references(tool_names: &[&str]) -> Vec<Self> {
+        tool_names
+            .iter()
+            .map(|name| Self::ToolReference {
+                name: (*name).to_string(),
+            })
+            .collect()
+    }
+}
+
+/// A toolset definition: one `tools` entry, with no `name`, that declares a
+/// whole tool family (`computer_toolset_20260801` or
+/// `browser_toolset_20260801`).
+///
+/// The model calls the family's members with `tool_use` blocks whose
+/// `toolset_name` names the family; answer them with `tool_result` blocks
+/// carrying the same `toolset_name`.
+///
+/// # Example
+///
+/// ```
+/// use claude_agent_rust_sdk::types::Toolset;
+///
+/// let computer = Toolset::computer()
+///     .with_member_config("zoom", serde_json::json!({"enabled": false}));
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Toolset {
+    /// The toolset type, e.g. `"computer_toolset_20260801"`.
+    #[serde(rename = "type")]
+    pub toolset_type: String,
+
+    /// Sparse per-member overrides keyed by member name. Members without an
+    /// entry keep their defaults; every member is enabled by default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configs: Option<serde_json::Map<String, serde_json::Value>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+impl Toolset {
+    /// Create a toolset entry of any type.
+    #[must_use]
+    pub fn new(toolset_type: &str) -> Self {
+        Self {
+            toolset_type: toolset_type.to_string(),
+            configs: None,
+            cache_control: None,
+        }
+    }
+
+    /// The computer toolset (`computer_toolset_20260801`).
+    #[must_use]
+    pub fn computer() -> Self {
+        Self::new("computer_toolset_20260801")
+    }
+
+    /// The browser toolset (`browser_toolset_20260801`).
+    #[must_use]
+    pub fn browser() -> Self {
+        Self::new("browser_toolset_20260801")
+    }
+
+    /// Override one member's configuration, e.g.
+    /// `("zoom", json!({"enabled": false}))`.
+    #[must_use]
+    pub fn with_member_config(mut self, member: &str, config: serde_json::Value) -> Self {
+        self.configs
+            .get_or_insert_with(serde_json::Map::new)
+            .insert(member.to_string(), config);
+        self
+    }
+
+    /// Attach a cache-control breakpoint to this entry.
+    #[must_use]
+    pub fn with_cache_control(mut self, cache_control: CacheControl) -> Self {
+        self.cache_control = Some(cache_control);
+        self
+    }
+}
+
+/// A tool definition: a custom tool, a server tool, or a toolset.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ToolDefinition {
@@ -391,6 +663,8 @@ pub enum ToolDefinition {
     Custom(Tool),
     /// A server-side tool (web search, code execution, etc.).
     Server(ServerTool),
+    /// A toolset entry (computer or browser tool family).
+    Toolset(Toolset),
 }
 
 // ---------------------------------------------------------------------------
@@ -470,24 +744,39 @@ impl<'de> Deserialize<'de> for ToolChoice {
 // ThinkingConfig
 // ---------------------------------------------------------------------------
 
-/// Configuration for extended thinking.
+/// Configuration for Claude's thinking.
+///
+/// Which variants a model accepts, and what omitting `thinking` means, depend
+/// on the model. Manual [`ThinkingConfig::Enabled`] is deprecated on Claude
+/// Opus 4.6 and Sonnet 4.6 and rejected by later models, which use
+/// [`ThinkingConfig::Adaptive`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ThinkingConfig {
-    /// Extended thinking is enabled with a specific budget.
+    /// Manual extended thinking with a fixed budget.
     Enabled {
         /// Maximum tokens the model can use for internal reasoning.
         /// Must be >= 1024 and less than `max_tokens`.
         budget_tokens: u32,
+        /// How thinking appears in the response: `"summarized"` or
+        /// `"omitted"` (content redacted, signature kept for multi-turn
+        /// continuity). The default depends on the model.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display: Option<String>,
     },
-    /// Extended thinking is disabled (default).
+    /// Thinking is turned off. Some models reject this.
     Disabled {},
-    /// Adaptive thinking -- the model decides whether to think.
-    /// Recommended for Claude Opus 4.6.
+    /// No up-front thinking: the model thinks only between tool calls.
+    BetweenTools {},
+    /// Adaptive thinking -- the model decides when and how much to think.
     Adaptive {
         /// Optional budget; if omitted the model decides.
         #[serde(skip_serializing_if = "Option::is_none")]
         budget_tokens: Option<u32>,
+        /// How thinking appears in the response: `"summarized"` or
+        /// `"omitted"`. The default depends on the model.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display: Option<String>,
     },
 }
 
@@ -579,24 +868,27 @@ pub enum OutputFormat {
 // CreateMessageRequest
 // ---------------------------------------------------------------------------
 
+/// Request-level diagnostics (the `diagnostics` request parameter).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Diagnostics {
+    /// The `id` (`msg_...`) of this client's previous response. The server
+    /// compares that request's prompt with this one and reports why the
+    /// prompt cache could not reuse its prefix. `None` is sent as `null`,
+    /// which opts in on a first turn with nothing to compare against.
+    pub previous_message_id: Option<String>,
+}
+
 /// Body of a `POST /v1/messages` request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateMessageRequest {
     pub model: String,
+    /// Maximum tokens to generate. `0` populates the prompt cache without
+    /// generating a response.
     pub max_tokens: u32,
     pub messages: Vec<Message>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<SystemPrompt>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f64>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f64>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_k: Option<u32>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequences: Option<Vec<String>>,
@@ -624,6 +916,17 @@ pub struct CreateMessageRequest {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
+
+    /// Inference speed mode: `"standard"` or `"fast"` (high output tokens
+    /// per second). Some models require the `fast-mode-2026-02-01` beta
+    /// header for any `speed` value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
+
+    /// Request-level diagnostics. Supply the previous response's `id` to get
+    /// `diagnostics.cache_miss_reason` back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Diagnostics>,
 }
 
 // ---------------------------------------------------------------------------
@@ -645,6 +948,10 @@ pub enum ResponseContentBlock {
         id: String,
         name: String,
         input: serde_json::Value,
+        /// For a toolset member call (e.g. a computer or browser action), the
+        /// toolset family. Echo it in the matching `tool_result`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        toolset_name: Option<String>,
     },
     /// A server tool invocation (`web_fetch`, `web_search`, etc.).
     ///
@@ -728,6 +1035,14 @@ pub enum Citation {
     },
 }
 
+/// Breakdown of output tokens by category.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OutputTokensDetails {
+    /// Output tokens generated as internal reasoning (the raw reasoning, not
+    /// the possibly shorter summarized text). Always <= `output_tokens`.
+    pub thinking_tokens: u64,
+}
+
 /// Token-usage statistics returned with every response.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
@@ -741,6 +1056,58 @@ pub struct Usage {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<u64>,
+
+    /// Breakdown of `output_tokens`, which remains the billed total.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens_details: Option<OutputTokensDetails>,
+
+    /// The inference speed mode used: `"standard"` or `"fast"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
+}
+
+/// Structured information about why output stopped (`stop_details`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StopDetails {
+    /// The kind of detail; currently `"refusal"`.
+    #[serde(rename = "type")]
+    pub details_type: String,
+
+    /// For a refusal, the policy category: `"cyber"`, `"bio"`,
+    /// `"frontier_llm"`, `"reasoning_extraction"`, or `"general_harms"`.
+    /// `None` when the refusal maps to no named category.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+
+    /// Human-readable explanation. The text is not guaranteed to be stable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+}
+
+/// Response-side diagnostics, present when the request supplied
+/// [`Diagnostics`] and the prompt cache diverged from the previous request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseDiagnostics {
+    /// Why the prompt cache could not fully reuse the previous request's
+    /// prefix. `None` means the diagnosis was still pending.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_miss_reason: Option<CacheMissReason>,
+}
+
+/// Why the prompt cache missed, reported in [`ResponseDiagnostics`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheMissReason {
+    /// `"model_changed"`, `"system_changed"`, `"tools_changed"`,
+    /// `"messages_changed"`, `"previous_message_not_found"`, or
+    /// `"unavailable"`.
+    #[serde(rename = "type")]
+    pub reason_type: String,
+
+    /// Approximate input tokens that would have been read from cache had the
+    /// prefix matched. Absent for `previous_message_not_found` and
+    /// `unavailable`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_missed_input_tokens: Option<u64>,
 }
 
 /// Body of a successful `POST /v1/messages` response.
@@ -756,13 +1123,23 @@ pub struct CreateMessageResponse {
     pub role: Role,
     pub content: Vec<ResponseContentBlock>,
 
+    /// `"end_turn"`, `"max_tokens"`, `"stop_sequence"`, `"tool_use"`,
+    /// `"pause_turn"`, `"refusal"`, or `"model_context_window_exceeded"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequence: Option<String>,
 
+    /// Structured detail for the `stop_reason` (e.g. a refusal category).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_details: Option<StopDetails>,
+
     pub usage: Usage,
+
+    /// Prompt-cache diagnostics, when the request supplied `diagnostics`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<ResponseDiagnostics>,
 }
 
 impl CreateMessageResponse {
@@ -817,9 +1194,9 @@ impl CreateMessageResponse {
         self.content
             .iter()
             .filter_map(|block| match block {
-                ResponseContentBlock::ToolUse { id, name, input } => {
-                    Some((id.as_str(), name.as_str(), input))
-                }
+                ResponseContentBlock::ToolUse {
+                    id, name, input, ..
+                } => Some((id.as_str(), name.as_str(), input)),
                 _ => None,
             })
             .collect()
@@ -847,6 +1224,10 @@ pub struct CountTokensRequest {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
+
+    /// Inference speed mode: `"standard"` or `"fast"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
 }
 
 /// Body of a `POST /v1/messages/count_tokens` response.
@@ -918,6 +1299,9 @@ pub enum StreamContentBlock {
         id: String,
         name: String,
         input: serde_json::Value,
+        /// For a toolset member call, the toolset family.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        toolset_name: Option<String>,
     },
     /// A thinking content block.
     Thinking { thinking: String },
@@ -937,13 +1321,15 @@ pub enum ContentDelta {
     SignatureDelta { signature: String },
 }
 
-/// Top-level message delta (`stop_reason`, `stop_sequence`).
+/// Top-level message delta (`stop_reason`, `stop_sequence`, `stop_details`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageDeltaData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequence: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_details: Option<StopDetails>,
 }
 
 /// An error inside the event stream.
@@ -1140,6 +1526,7 @@ mod tests {
                 url: "https://example.com/img.jpg".into(),
             },
             cache_control: None,
+            transformations: None,
         };
         let json = serde_json::to_value(&block).unwrap();
         assert_eq!(json["type"], "image");
@@ -1188,13 +1575,16 @@ mod tests {
             id: "toolu_123".into(),
             name: "get_weather".into(),
             input: serde_json::json!({"location": "SF"}),
+            toolset_name: None,
         };
         let json = serde_json::to_value(&block).unwrap();
         assert_eq!(json["type"], "tool_use");
         assert_eq!(json["name"], "get_weather");
         let back: ContentBlock = serde_json::from_value(json).unwrap();
         match back {
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "toolu_123");
                 assert_eq!(name, "get_weather");
                 assert_eq!(input["location"], "SF");
@@ -1210,6 +1600,7 @@ mod tests {
             content: ToolResultContent::Text("72F".into()),
             is_error: None,
             cache_control: None,
+            toolset_name: None,
         };
         let json = serde_json::to_value(&block).unwrap();
         assert_eq!(json["type"], "tool_result");
@@ -1304,13 +1695,14 @@ mod tests {
     fn thinking_config_enabled_round_trip() {
         let tc = ThinkingConfig::Enabled {
             budget_tokens: 10000,
+            display: None,
         };
         let json = serde_json::to_value(&tc).unwrap();
         assert_eq!(json["type"], "enabled");
         assert_eq!(json["budget_tokens"], 10000);
         let back: ThinkingConfig = serde_json::from_value(json).unwrap();
         match back {
-            ThinkingConfig::Enabled { budget_tokens } => assert_eq!(budget_tokens, 10000),
+            ThinkingConfig::Enabled { budget_tokens, .. } => assert_eq!(budget_tokens, 10000),
             _ => panic!("expected Enabled"),
         }
     }
@@ -1325,16 +1717,37 @@ mod tests {
     }
 
     #[test]
+    fn thinking_config_between_tools_round_trip() {
+        let back: ThinkingConfig =
+            serde_json::from_value(serde_json::json!({"type": "between_tools"})).unwrap();
+        assert!(matches!(back, ThinkingConfig::BetweenTools {}));
+    }
+
+    #[test]
+    fn thinking_config_adaptive_display_omitted() {
+        let tc = ThinkingConfig::Adaptive {
+            budget_tokens: None,
+            display: Some("omitted".into()),
+        };
+        let json = serde_json::to_value(&tc).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"type": "adaptive", "display": "omitted"})
+        );
+    }
+
+    #[test]
     fn thinking_config_adaptive_round_trip() {
         let tc = ThinkingConfig::Adaptive {
             budget_tokens: Some(5000),
+            display: None,
         };
         let json = serde_json::to_value(&tc).unwrap();
         assert_eq!(json["type"], "adaptive");
         assert_eq!(json["budget_tokens"], 5000);
         let back: ThinkingConfig = serde_json::from_value(json).unwrap();
         match back {
-            ThinkingConfig::Adaptive { budget_tokens } => {
+            ThinkingConfig::Adaptive { budget_tokens, .. } => {
                 assert_eq!(budget_tokens, Some(5000));
             }
             _ => panic!("expected Adaptive"),
@@ -1345,6 +1758,7 @@ mod tests {
     fn thinking_config_adaptive_no_budget() {
         let tc = ThinkingConfig::Adaptive {
             budget_tokens: None,
+            display: None,
         };
         let json = serde_json::to_value(&tc).unwrap();
         assert_eq!(json["type"], "adaptive");
@@ -1666,6 +2080,154 @@ mod tests {
         assert!(json.get("allowed_callers").is_none());
     }
 
+    #[test]
+    fn web_fetch_url_sources_serialize_nested_tags() {
+        let tool = ServerTool::new("web_fetch_20260318", "web_fetch")
+            .with_url_sources(WebFetchUrlSources {
+                user_input: Some(UrlSource::None {}),
+                client_tool_results: Some(UrlSource::only(&["search_docs"])),
+                server_tool_results: Some(UrlSource::except(&["web_search"])),
+            })
+            .with_response_inclusion("excluded")
+            .with_use_cache(false);
+        let json = serde_json::to_value(&tool).unwrap();
+        assert_eq!(json["type"], "web_fetch_20260318");
+        assert_eq!(
+            json["url_sources"],
+            serde_json::json!({
+                "user_input": {"type": "none"},
+                "client_tool_results": {
+                    "type": "only",
+                    "tools": [{"type": "tool_reference", "name": "search_docs"}]
+                },
+                "server_tool_results": {
+                    "type": "except",
+                    "tools": [{"type": "tool_reference", "name": "web_search"}]
+                }
+            })
+        );
+        assert_eq!(json["response_inclusion"], "excluded");
+        assert_eq!(json["use_cache"], false);
+
+        let back: ServerTool = serde_json::from_value(json).unwrap();
+        assert!(
+            back.extra.is_empty(),
+            "typed fields must not leak into extra"
+        );
+        assert!(matches!(
+            back.url_sources.unwrap().user_input,
+            Some(UrlSource::None {})
+        ));
+    }
+
+    #[test]
+    fn toolset_serializes_without_name() {
+        let td = ToolDefinition::Toolset(
+            Toolset::computer().with_member_config("zoom", serde_json::json!({"enabled": false})),
+        );
+        let json = serde_json::to_value(&td).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "computer_toolset_20260801",
+                "configs": {"zoom": {"enabled": false}}
+            })
+        );
+    }
+
+    #[test]
+    fn tool_definition_deserializes_each_kind() {
+        let tools: Vec<ToolDefinition> = serde_json::from_value(serde_json::json!([
+            {"name": "calc", "description": "Calculator", "input_schema": {"type": "object"}},
+            {"type": "web_search_20260318", "name": "web_search"},
+            {"type": "browser_toolset_20260801"}
+        ]))
+        .unwrap();
+        assert!(matches!(tools[0], ToolDefinition::Custom(_)));
+        assert!(matches!(tools[1], ToolDefinition::Server(_)));
+        match &tools[2] {
+            ToolDefinition::Toolset(t) => assert_eq!(t.toolset_type, "browser_toolset_20260801"),
+            other => panic!("expected Toolset, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toolset_tool_result_with_browser_state() {
+        let block = ContentBlock::ToolResult {
+            tool_use_id: "toolu_7".into(),
+            content: ToolResultContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: "Clicked.".into(),
+                    cache_control: None,
+                },
+                ContentBlock::BrowserState {
+                    tabs: vec![BrowserTab {
+                        tab_id: "t1".into(),
+                        title: String::new(),
+                        url: String::new(),
+                        active: Some(true),
+                    }],
+                    state_changes: Some(vec![
+                        BrowserStateChange::TabOpened {
+                            tab_id: "t1".into(),
+                        },
+                        BrowserStateChange::DownloadCompleted {
+                            download_id: "d1".into(),
+                            url: "https://example.com/a.pdf".into(),
+                            path: None,
+                            size_bytes: Some(2048),
+                        },
+                    ]),
+                    cache_control: None,
+                },
+            ]),
+            is_error: None,
+            cache_control: None,
+            toolset_name: Some("browser".into()),
+        };
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["toolset_name"], "browser");
+        let state = &json["content"][1];
+        assert_eq!(state["type"], "browser_state");
+        assert_eq!(state["tabs"][0]["active"], true);
+        assert_eq!(
+            state["state_changes"][0],
+            serde_json::json!({"type": "tab_opened", "tab_id": "t1"})
+        );
+        assert_eq!(state["state_changes"][1]["type"], "download_completed");
+        assert!(state["state_changes"][1].get("path").is_none());
+    }
+
+    #[test]
+    fn image_transformations_and_file_document_source() {
+        let blocks = vec![
+            ContentBlock::Image {
+                source: ImageSource::File {
+                    file_id: "file_1".into(),
+                },
+                cache_control: None,
+                transformations: Some(ImageTransformations {
+                    oversized_image: Some("error".into()),
+                }),
+            },
+            ContentBlock::Document {
+                source: DocumentSource::File {
+                    file_id: "file_2".into(),
+                },
+                cache_control: None,
+                citations: None,
+                context: None,
+                title: None,
+            },
+        ];
+        let json = serde_json::to_value(&blocks).unwrap();
+        assert_eq!(json[0]["transformations"]["oversized_image"], "error");
+        assert_eq!(
+            json[1]["source"],
+            serde_json::json!({"type": "file", "file_id": "file_2"})
+        );
+    }
+
     // -- CitationsConfig --
 
     #[test]
@@ -1748,9 +2310,6 @@ mod tests {
                 content: MessageContent::Text("Hello".into()),
             }],
             system: None,
-            temperature: None,
-            top_p: None,
-            top_k: None,
             stop_sequences: None,
             stream: None,
             tools: None,
@@ -1760,15 +2319,18 @@ mod tests {
             output_config: None,
             thinking: None,
             service_tier: None,
+            speed: None,
+            diagnostics: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["model"], "claude-haiku-4-5");
         assert_eq!(json["max_tokens"], 1024);
         // Optional fields should be absent
         assert!(json.get("system").is_none());
-        assert!(json.get("temperature").is_none());
         assert!(json.get("thinking").is_none());
         assert!(json.get("service_tier").is_none());
+        assert!(json.get("speed").is_none());
+        assert!(json.get("diagnostics").is_none());
     }
 
     #[test]
@@ -1781,9 +2343,6 @@ mod tests {
                 content: MessageContent::Text("Think hard.".into()),
             }],
             system: None,
-            temperature: None,
-            top_p: None,
-            top_k: None,
             stop_sequences: None,
             stream: None,
             tools: None,
@@ -1793,8 +2352,11 @@ mod tests {
             output_config: None,
             thinking: Some(ThinkingConfig::Enabled {
                 budget_tokens: 10000,
+                display: None,
             }),
             service_tier: None,
+            speed: None,
+            diagnostics: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["thinking"]["type"], "enabled");
@@ -1826,10 +2388,30 @@ mod tests {
         });
         let block: ResponseContentBlock = serde_json::from_value(json).unwrap();
         match block {
-            ResponseContentBlock::ToolUse { id, name, input } => {
+            ResponseContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "toolu_123");
                 assert_eq!(name, "calc");
                 assert_eq!(input["expr"], "2+2");
+            }
+            _ => panic!("expected ToolUse"),
+        }
+    }
+
+    #[test]
+    fn response_content_block_toolset_tool_use() {
+        let json = serde_json::json!({
+            "type": "tool_use",
+            "id": "toolu_9",
+            "name": "left_click",
+            "input": {"coordinate": [10, 20]},
+            "toolset_name": "computer"
+        });
+        let block: ResponseContentBlock = serde_json::from_value(json).unwrap();
+        match block {
+            ResponseContentBlock::ToolUse { toolset_name, .. } => {
+                assert_eq!(toolset_name.as_deref(), Some("computer"));
             }
             _ => panic!("expected ToolUse"),
         }
@@ -1929,6 +2511,8 @@ mod tests {
             output_tokens: 50,
             cache_creation_input_tokens: Some(200),
             cache_read_input_tokens: None,
+            output_tokens_details: None,
+            speed: None,
         };
         let json = serde_json::to_value(&u).unwrap();
         assert_eq!(json["input_tokens"], 100);
@@ -1965,7 +2549,9 @@ mod tests {
             ],
             stop_reason: Some("end_turn".into()),
             stop_sequence: None,
+            stop_details: None,
             usage: Usage::default(),
+            diagnostics: None,
         };
         assert_eq!(resp.text(), Some("Hello!"));
         assert_eq!(resp.thinking(), Some("hmm"));
@@ -1983,10 +2569,13 @@ mod tests {
                 id: "toolu_1".into(),
                 name: "calc".into(),
                 input: serde_json::json!({"x": 1}),
+                toolset_name: None,
             }],
             stop_reason: Some("tool_use".into()),
             stop_sequence: None,
+            stop_details: None,
             usage: Usage::default(),
+            diagnostics: None,
         };
         let uses = resp.tool_uses();
         assert_eq!(uses.len(), 1);
@@ -2019,6 +2608,95 @@ mod tests {
         assert_eq!(resp.usage.input_tokens, 25);
     }
 
+    #[test]
+    fn create_message_response_refusal_details_usage_and_diagnostics() {
+        let json = serde_json::json!({
+            "id": "msg_02",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-opus-5-5",
+            "content": [],
+            "stop_reason": "refusal",
+            "stop_sequence": null,
+            "stop_details": {
+                "type": "refusal",
+                "category": "cyber",
+                "explanation": "Could enable malware development."
+            },
+            "usage": {
+                "input_tokens": 30,
+                "output_tokens": 12,
+                "output_tokens_details": {"thinking_tokens": 8},
+                "speed": "fast"
+            },
+            "diagnostics": {
+                "cache_miss_reason": {"type": "tools_changed", "cache_missed_input_tokens": 1200}
+            }
+        });
+        let resp: CreateMessageResponse = serde_json::from_value(json).unwrap();
+        let details = resp.stop_details.unwrap();
+        assert_eq!(details.details_type, "refusal");
+        assert_eq!(details.category.as_deref(), Some("cyber"));
+        assert_eq!(resp.usage.output_tokens_details.unwrap().thinking_tokens, 8);
+        assert_eq!(resp.usage.speed.as_deref(), Some("fast"));
+        let reason = resp.diagnostics.unwrap().cache_miss_reason.unwrap();
+        assert_eq!(reason.reason_type, "tools_changed");
+        assert_eq!(reason.cache_missed_input_tokens, Some(1200));
+    }
+
+    #[test]
+    fn create_message_response_pending_and_tokenless_cache_miss_reasons() {
+        let pending: ResponseDiagnostics =
+            serde_json::from_value(serde_json::json!({"cache_miss_reason": null})).unwrap();
+        assert!(pending.cache_miss_reason.is_none());
+
+        let not_found: CacheMissReason =
+            serde_json::from_value(serde_json::json!({"type": "previous_message_not_found"}))
+                .unwrap();
+        assert_eq!(not_found.reason_type, "previous_message_not_found");
+        assert!(not_found.cache_missed_input_tokens.is_none());
+    }
+
+    #[test]
+    fn create_message_response_null_stop_details() {
+        let json = serde_json::json!({
+            "id": "msg_03",
+            "role": "assistant",
+            "model": "claude-opus-5-5",
+            "content": [],
+            "stop_reason": "model_context_window_exceeded",
+            "stop_details": null,
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let resp: CreateMessageResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            resp.stop_reason.as_deref(),
+            Some("model_context_window_exceeded")
+        );
+        assert!(resp.stop_details.is_none());
+    }
+
+    #[test]
+    fn message_delta_carries_stop_details() {
+        let json = serde_json::json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": "refusal",
+                "stop_sequence": null,
+                "stop_details": {"type": "refusal", "category": null, "explanation": null}
+            },
+            "usage": {"output_tokens": 3}
+        });
+        match serde_json::from_value::<StreamEvent>(json).unwrap() {
+            StreamEvent::MessageDelta { delta, .. } => {
+                let details = delta.stop_details.unwrap();
+                assert_eq!(details.details_type, "refusal");
+                assert!(details.category.is_none());
+            }
+            _ => panic!("expected MessageDelta"),
+        }
+    }
+
     // -- CountTokensRequest / Response --
 
     #[test]
@@ -2033,6 +2711,7 @@ mod tests {
             tools: None,
             thinking: None,
             tool_choice: None,
+            speed: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["model"], "claude-haiku-4-5");

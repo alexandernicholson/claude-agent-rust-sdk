@@ -34,7 +34,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // This large context block will be cached for 5 minutes.
         .system_with_cache(&large_context, CacheControl::ephemeral_5m())
         .user("What is the legal standard for negligence in tort law?")
-        .temperature(0.3)
         .send()
         .await?;
 
@@ -61,7 +60,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_tokens(1024)
         .system_with_cache(&large_context, CacheControl::ephemeral_5m())
         .user("What is the difference between a felony and a misdemeanor?")
-        .temperature(0.3)
         .send()
         .await?;
 

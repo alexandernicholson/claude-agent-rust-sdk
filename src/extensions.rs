@@ -160,7 +160,8 @@ impl SdkBeta {
 
 /// System prompt configuration.
 ///
-/// Mirrors the official `str | SystemPromptPreset | SystemPromptFile` union.
+/// Mirrors the official `str | SystemPromptPreset | SystemPromptCustom |
+/// SystemPromptFile` union.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SystemPrompt {
     /// A custom system prompt string.
@@ -173,6 +174,20 @@ pub enum SystemPrompt {
         ///
         /// Sent in the initialize control request, not as a CLI flag.
         exclude_dynamic_sections: Option<bool>,
+        /// Whether the session keeps the system prompt it recorded on its first
+        /// request (CLI 2.1.257+). `None` leaves the CLI default.
+        ///
+        /// Sent in the initialize control request as `systemPromptSnapshot`.
+        snapshot: Option<bool>,
+    },
+    /// A custom prompt in the form that can also set `snapshot`.
+    ///
+    /// Equivalent to [`SystemPrompt::Text`] on the CLI command line.
+    Custom {
+        /// The system prompt text.
+        prompt: String,
+        /// Same as the `snapshot` field of [`SystemPrompt::Preset`].
+        snapshot: Option<bool>,
     },
     /// Load the system prompt from a file path.
     File {
@@ -194,6 +209,16 @@ impl SystemPrompt {
         Self::Preset {
             append: None,
             exclude_dynamic_sections: None,
+            snapshot: None,
+        }
+    }
+
+    /// The configured `snapshot` flag, for `Preset` and `Custom` prompts.
+    #[must_use]
+    pub const fn snapshot(&self) -> Option<bool> {
+        match self {
+            Self::Preset { snapshot, .. } | Self::Custom { snapshot, .. } => *snapshot,
+            Self::Text(_) | Self::File { .. } => None,
         }
     }
 }
@@ -895,16 +920,14 @@ pub struct SandboxNetworkConfig {
     pub socks_proxy_port: Option<i64>,
 }
 
-/// Violations to ignore in the sandbox.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct SandboxIgnoreViolations {
-    /// File paths for which violations are ignored.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file: Option<Vec<String>>,
-    /// Network hosts for which violations are ignored.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub network: Option<Vec<String>>,
-}
+/// Sandbox violations to leave unreported.
+///
+/// Maps a command pattern (`"*"` matches every command) to substrings of the
+/// violation text. A violation is left unreported when the command's text
+/// contains the pattern and the violation's text contains one of the strings;
+/// both checks are plain substring matches, not globs. Only affects reporting,
+/// not what the sandbox blocks.
+pub type SandboxIgnoreViolations = BTreeMap<String, Vec<String>>;
 
 /// Sandbox settings controlling filesystem/network isolation of bash commands.
 ///
@@ -1440,6 +1463,14 @@ impl HookEvent {
     }
 }
 
+/// Reasoning effort in effect when a hook fires.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookEffort {
+    /// Effort level for the current turn (e.g. `"low"`, `"high"`, `"max"`),
+    /// after any downgrade for the selected model.
+    pub level: String,
+}
+
 /// Base fields present across many hook events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BaseHookInput {
@@ -1452,6 +1483,12 @@ pub struct BaseHookInput {
     /// Current permission mode, when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
+    /// UUID of the user prompt being processed. Absent until the first user input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<String>,
+    /// Effort in effect for the current turn, on models that support effort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<HookEffort>,
 }
 
 /// Input for `PreToolUse` events.
@@ -1488,6 +1525,9 @@ pub struct PostToolUseHookInput {
     /// Agent type name, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_type: Option<String>,
+    /// Tool execution time in milliseconds, excluding permission-prompt and hook time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 /// Input for `PostToolUseFailure` events.
@@ -1510,6 +1550,9 @@ pub struct PostToolUseFailureHookInput {
     /// Agent type name, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_type: Option<String>,
+    /// Tool execution time in milliseconds, excluding permission-prompt and hook time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 /// Input for `UserPromptSubmit` events.
@@ -1519,11 +1562,65 @@ pub struct UserPromptSubmitHookInput {
     pub prompt: String,
 }
 
+/// In-flight background task, as listed on `Stop` and `SubagentStop` inputs.
+///
+/// `description` and `command` are capped at 1000 characters; a clipped value
+/// ends with an in-string `"… [+N chars]"` marker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundTaskSummary {
+    /// Task identifier.
+    pub id: String,
+    /// Task-type label (e.g. `"shell"`, `"subagent"`, `"monitor"`, `"workflow"`).
+    #[serde(rename = "type")]
+    pub task_type: String,
+    /// Task status.
+    pub status: String,
+    /// Task description.
+    pub description: String,
+    /// Shell command line. Only present for `shell` tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Sub-agent type name. Only present for `subagent` tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    /// MCP server name. Only present for `monitor` / MCP tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    /// MCP tool name. Only present for `monitor` / MCP tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Workflow name. Only present for `workflow` tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Session-scoped scheduled wakeup, as listed on `Stop` and `SubagentStop` inputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCronSummary {
+    /// Cron identifier.
+    pub id: String,
+    /// Cron expression, e.g. `"0 9 * * 1-5"`.
+    pub schedule: String,
+    /// False for one-shot wakeups; true for tasks that re-fire on every match.
+    pub recurring: bool,
+    /// Prompt submitted when the cron fires (capped at 1000 characters).
+    pub prompt: String,
+}
+
 /// Input for `Stop` events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StopHookInput {
     /// Whether the stop hook is already active.
     pub stop_hook_active: bool,
+    /// Text content of the last assistant message before stopping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_assistant_message: Option<String>,
+    /// In-flight background work in this session. Empty when nothing is in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_tasks: Option<Vec<BackgroundTaskSummary>>,
+    /// Session-scoped scheduled wakeups that will resume this session later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_crons: Option<Vec<SessionCronSummary>>,
 }
 
 /// Input for `SubagentStop` events.
@@ -1537,6 +1634,15 @@ pub struct SubagentStopHookInput {
     pub agent_transcript_path: String,
     /// Agent type name.
     pub agent_type: String,
+    /// Text content of the sub-agent's last assistant message before stopping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_assistant_message: Option<String>,
+    /// In-flight background work, scoped to the parent session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_tasks: Option<Vec<BackgroundTaskSummary>>,
+    /// Scheduled wakeups, scoped to the parent session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_crons: Option<Vec<SessionCronSummary>>,
 }
 
 /// The trigger for a `PreCompact` event.
@@ -1791,6 +1897,20 @@ pub struct UserPromptSubmitHookSpecificOutput {
         skip_serializing_if = "Option::is_none"
     )]
     pub additional_context: Option<String>,
+    /// Sets the session title.
+    #[serde(
+        rename = "sessionTitle",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub session_title: Option<String>,
+    /// When `decision` is `"block"`, omit the original prompt from the block message.
+    #[serde(
+        rename = "suppressOriginalPrompt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub suppress_original_prompt: Option<bool>,
 }
 
 /// Hook-specific output for `SessionStart` events.
@@ -1806,6 +1926,36 @@ pub struct SessionStartHookSpecificOutput {
         skip_serializing_if = "Option::is_none"
     )]
     pub additional_context: Option<String>,
+    /// Used as the first user message of the session.
+    #[serde(
+        rename = "initialUserMessage",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub initial_user_message: Option<String>,
+    /// Sets the session title. Ignored when the session starts from `clear`
+    /// or `compact`.
+    #[serde(
+        rename = "sessionTitle",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub session_title: Option<String>,
+    /// Absolute paths to watch for `FileChanged` events during this session.
+    #[serde(
+        rename = "watchPaths",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub watch_paths: Option<Vec<String>>,
+    /// Re-scan skill and command directories after `SessionStart` hooks
+    /// complete, so skills the hook installed are available in the same session.
+    #[serde(
+        rename = "reloadSkills",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reload_skills: Option<bool>,
 }
 
 /// Hook-specific output for `Notification` events.
@@ -1846,6 +1996,224 @@ pub struct PermissionRequestHookSpecificOutput {
     pub hook_event_name: String,
     /// The permission decision payload.
     pub decision: Value,
+}
+
+/// Hook-specific output for `UserPromptExpansion` events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserPromptExpansionHookSpecificOutput {
+    /// Event discriminator (`"UserPromptExpansion"`).
+    #[serde(rename = "hookEventName")]
+    pub hook_event_name: String,
+    /// Additional context injected for the model.
+    #[serde(
+        rename = "additionalContext",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub additional_context: Option<String>,
+    /// When `decision` is `"block"`, omit the original prompt from the block message.
+    #[serde(
+        rename = "suppressOriginalPrompt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub suppress_original_prompt: Option<bool>,
+}
+
+/// Hook-specific output for `PostToolBatch` events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostToolBatchHookSpecificOutput {
+    /// Event discriminator (`"PostToolBatch"`).
+    #[serde(rename = "hookEventName")]
+    pub hook_event_name: String,
+    /// Additional context injected for the model.
+    #[serde(
+        rename = "additionalContext",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub additional_context: Option<String>,
+}
+
+/// Hook-specific output for `Stop` events.
+///
+/// `additionalContext` is non-error feedback delivered to the model; the
+/// conversation continues so the model can act on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopHookSpecificOutput {
+    /// Event discriminator (`"Stop"`).
+    #[serde(rename = "hookEventName")]
+    pub hook_event_name: String,
+    /// Non-error feedback delivered to the model.
+    #[serde(
+        rename = "additionalContext",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub additional_context: Option<String>,
+}
+
+/// Hook-specific output for `SubagentStop` events.
+///
+/// `additionalContext` is non-error feedback delivered to the sub-agent; the
+/// sub-agent continues so it can act on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentStopHookSpecificOutput {
+    /// Event discriminator (`"SubagentStop"`).
+    #[serde(rename = "hookEventName")]
+    pub hook_event_name: String,
+    /// Non-error feedback delivered to the sub-agent.
+    #[serde(
+        rename = "additionalContext",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub additional_context: Option<String>,
+}
+
+/// Hook-specific output for `PermissionDenied` events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionDeniedHookSpecificOutput {
+    /// Event discriminator (`"PermissionDenied"`).
+    #[serde(rename = "hookEventName")]
+    pub hook_event_name: String,
+    /// Tell the model it may retry the denied tool call. Ignored for denials
+    /// without a classifier verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<bool>,
+}
+
+/// Hook-specific output for `PreModelSwitch` events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreModelSwitchHookSpecificOutput {
+    /// Event discriminator (`"PreModelSwitch"`).
+    #[serde(rename = "hookEventName")]
+    pub hook_event_name: String,
+    /// `"allow"` proceeds, `"deny"` cancels the switch. `"ask"` is treated as a
+    /// refusal outside an interactive session.
+    #[serde(
+        rename = "permissionDecision",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub permission_decision: Option<String>,
+    /// Reason for the permission decision.
+    #[serde(
+        rename = "permissionDecisionReason",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub permission_decision_reason: Option<String>,
+}
+
+/// Hook-specific output for `PostModelSwitch` events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostModelSwitchHookSpecificOutput {
+    /// Event discriminator (`"PostModelSwitch"`).
+    #[serde(rename = "hookEventName")]
+    pub hook_event_name: String,
+    /// Reaches the model with the next request the new model serves.
+    #[serde(
+        rename = "additionalContext",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub additional_context: Option<String>,
+}
+
+/// Hook-specific output for `Elicitation` events.
+///
+/// Return this to accept or decline an MCP elicitation request
+/// programmatically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElicitationHookSpecificOutput {
+    /// Event discriminator (`"Elicitation"`).
+    #[serde(rename = "hookEventName")]
+    pub hook_event_name: String,
+    /// `"accept"`, `"decline"` or `"cancel"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Form field values to submit. Only used when `action` is `"accept"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Value>,
+}
+
+/// Hook-specific output for `ElicitationResult` events.
+///
+/// Return this to override the action or content before the response is sent
+/// to the MCP server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElicitationResultHookSpecificOutput {
+    /// Event discriminator (`"ElicitationResult"`).
+    #[serde(rename = "hookEventName")]
+    pub hook_event_name: String,
+    /// `"accept"`, `"decline"` or `"cancel"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Replacement form field values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Value>,
+}
+
+/// Hook-specific output for `CwdChanged` events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CwdChangedHookSpecificOutput {
+    /// Event discriminator (`"CwdChanged"`).
+    #[serde(rename = "hookEventName")]
+    pub hook_event_name: String,
+    /// Absolute paths to watch for `FileChanged` events. Replaces the current
+    /// dynamic watch list.
+    #[serde(
+        rename = "watchPaths",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub watch_paths: Option<Vec<String>>,
+}
+
+/// Hook-specific output for `FileChanged` events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChangedHookSpecificOutput {
+    /// Event discriminator (`"FileChanged"`).
+    #[serde(rename = "hookEventName")]
+    pub hook_event_name: String,
+    /// Absolute paths to watch for `FileChanged` events. Replaces the current
+    /// dynamic watch list.
+    #[serde(
+        rename = "watchPaths",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub watch_paths: Option<Vec<String>>,
+}
+
+/// Hook-specific output for `WorktreeCreate` events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeCreateHookSpecificOutput {
+    /// Event discriminator (`"WorktreeCreate"`).
+    #[serde(rename = "hookEventName")]
+    pub hook_event_name: String,
+    /// Absolute path to the created worktree directory.
+    #[serde(rename = "worktreePath")]
+    pub worktree_path: String,
+}
+
+/// Hook-specific output for `MessageDisplay` events.
+///
+/// Display-only: replaces the text on screen without changing the stored
+/// message or what the model sees.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageDisplayHookSpecificOutput {
+    /// Event discriminator (`"MessageDisplay"`).
+    #[serde(rename = "hookEventName")]
+    pub hook_event_name: String,
+    /// Text displayed in place of the delta. Omit to display the original.
+    #[serde(
+        rename = "displayContent",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub display_content: Option<String>,
 }
 
 /// Synchronous hook output with control and decision fields.
@@ -2568,6 +2936,131 @@ mod tests {
                 "permissionDecision": "deny",
                 "permissionDecisionReason": "blocked"
             })
+        );
+    }
+
+    #[test]
+    fn new_hook_specific_outputs_wire_names() {
+        let session_start = SessionStartHookSpecificOutput {
+            hook_event_name: "SessionStart".into(),
+            additional_context: None,
+            initial_user_message: Some("hi".into()),
+            session_title: Some("t".into()),
+            watch_paths: Some(vec!["/a".into()]),
+            reload_skills: Some(true),
+        };
+        assert_eq!(
+            serde_json::to_value(&session_start).unwrap(),
+            json!({
+                "hookEventName": "SessionStart",
+                "initialUserMessage": "hi",
+                "sessionTitle": "t",
+                "watchPaths": ["/a"],
+                "reloadSkills": true
+            })
+        );
+        let worktree = WorktreeCreateHookSpecificOutput {
+            hook_event_name: "WorktreeCreate".into(),
+            worktree_path: "/w".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&worktree).unwrap(),
+            json!({"hookEventName": "WorktreeCreate", "worktreePath": "/w"})
+        );
+        let denied: PermissionDeniedHookSpecificOutput =
+            serde_json::from_value(json!({"hookEventName": "PermissionDenied", "retry": true}))
+                .unwrap();
+        assert_eq!(denied.retry, Some(true));
+    }
+
+    #[test]
+    fn stop_hook_input_parses_new_fields() {
+        let input = HookInput::from_value(json!({
+            "hook_event_name": "Stop",
+            "session_id": "s1",
+            "transcript_path": "/t",
+            "cwd": "/",
+            "prompt_id": "p1",
+            "effort": {"level": "high"},
+            "stop_hook_active": false,
+            "last_assistant_message": "done",
+            "background_tasks": [
+                {"id": "b1", "type": "shell", "status": "running", "description": "d", "command": "ls"}
+            ],
+            "session_crons": [
+                {"id": "c1", "schedule": "0 9 * * 1-5", "recurring": true, "prompt": "go"}
+            ]
+        }));
+        let base = input.base.as_ref().unwrap();
+        assert_eq!(base.prompt_id.as_deref(), Some("p1"));
+        assert_eq!(base.effort.as_ref().unwrap().level, "high");
+        match &input.event {
+            HookInputKind::Stop(stop) => {
+                assert_eq!(stop.last_assistant_message.as_deref(), Some("done"));
+                let tasks = stop.background_tasks.as_ref().unwrap();
+                assert_eq!(tasks[0].task_type, "shell");
+                assert_eq!(tasks[0].command.as_deref(), Some("ls"));
+                assert!(stop.session_crons.as_ref().unwrap()[0].recurring);
+            }
+            other => panic!("unexpected kind {other:?}"),
+        }
+    }
+
+    #[test]
+    fn post_tool_use_input_parses_duration() {
+        let input = HookInput::from_value(json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {},
+            "tool_response": "ok",
+            "tool_use_id": "tu",
+            "duration_ms": 42
+        }));
+        match &input.event {
+            HookInputKind::PostToolUse(post) => assert_eq!(post.duration_ms, Some(42)),
+            other => panic!("unexpected kind {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_ignore_violations_is_command_pattern_map() {
+        let mut ignore = SandboxIgnoreViolations::new();
+        ignore.insert("*".into(), vec!["/etc/hosts".into()]);
+        ignore.insert("npm test".into(), vec!["EPERM".into()]);
+        let settings = SandboxSettings {
+            ignore_violations: Some(ignore),
+            ..SandboxSettings::default()
+        };
+        let value = settings.to_json_value().unwrap();
+        assert_eq!(
+            value,
+            json!({"ignoreViolations": {"*": ["/etc/hosts"], "npm test": ["EPERM"]}})
+        );
+        let back: SandboxSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(back, settings);
+    }
+
+    #[test]
+    fn system_prompt_snapshot_accessor() {
+        assert_eq!(SystemPrompt::preset().snapshot(), None);
+        assert_eq!(SystemPrompt::text("x").snapshot(), None);
+        assert_eq!(SystemPrompt::File { path: "p".into() }.snapshot(), None);
+        assert_eq!(
+            SystemPrompt::Preset {
+                append: None,
+                exclude_dynamic_sections: None,
+                snapshot: Some(false),
+            }
+            .snapshot(),
+            Some(false)
+        );
+        assert_eq!(
+            SystemPrompt::Custom {
+                prompt: "p".into(),
+                snapshot: Some(true),
+            }
+            .snapshot(),
+            Some(true)
         );
     }
 }
